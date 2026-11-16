@@ -1,0 +1,17 @@
+# Workstation environment for the notebooks (not the Jetson).
+# torch/torchvision first, from the CUDA 12.8 index (required for RTX 50xx / Blackwell GPUs):
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
+# then:
+#   pip install -r notebooks/requirements.txt
+#   python -m ipykernel install --user --name go2yolo --display-name "Python (go2yolo)"
+ultralytics==8.4.137   # keep identical to the version installed on the Jetson (Dockerfile.subscriber)
+albumentations>=2.0
+opencv-python
+pandas
+matplotlib
+pyyaml
+tqdm
+ipykernel
+onnx
+onnxslim
+onnxruntime            # CPU is enough: only used for the ONNX sanity check

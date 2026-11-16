@@ -1,0 +1,7 @@
+datasets/
+runs/
+notebooks/.ipynb_checkpoints/
+*.onnx
+*.engine
+notebooks/*.pt
+notebooks/weights/

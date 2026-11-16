@@ -23,7 +23,9 @@ ROS_DOMAIN_ID="${ROS_DOMAIN_ID:-0}"          # match go2_ws and your zenoh bridg
 # container. Override HOST_MODEL_PATH if you want to point at a different
 # .pt file without editing this script.
 HOST_MODEL_PATH="${HOST_MODEL_PATH:-${SCRIPT_DIR}/models/fire_extinguisher_best.pt}"
-CONTAINER_MODEL_PATH="/workspace/fire_extinguisher_best.pt"
+# Mounted under its own file name so the extension (.pt / .engine / .onnx),
+# which ultralytics uses to pick the backend, is preserved.
+CONTAINER_MODEL_PATH="${CONTAINER_MODEL_PATH:-/workspace/$(basename "${HOST_MODEL_PATH}")}"
 MODEL_PATH="${MODEL_PATH:-${CONTAINER_MODEL_PATH}}"
 
 CONF_THRES="${CONF_THRES:-0.5}"
