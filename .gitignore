@@ -5,3 +5,4 @@ notebooks/.ipynb_checkpoints/
 *.engine
 notebooks/*.pt
 notebooks/weights/
+.venv/

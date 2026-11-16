@@ -1,0 +1,4 @@
+# Capture environment (tools/capture_dataset.py), installed in ./.venv
+pyrealsense2
+opencv-python
+numpy
