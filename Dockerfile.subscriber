@@ -91,6 +91,15 @@ RUN pip3 install --no-cache-dir --default-timeout=180 --retries 10 ultralytics -
       psutil \
       tqdm
 
+# onnxruntime-gpu (Jetson build, JP5/py3.8) for .onnx inference, plus onnx/onnxslim
+# so `yolo export format=engine half=True` works offline. TensorRT itself comes from L4T.
+# The wheel is bind-mounted (BuildKit) instead of COPY'd so it doesn't stay in an image layer.
+RUN --mount=type=bind,source=models,target=/tmp/wheels \
+    pip3 install --no-cache-dir --default-timeout=180 --retries 10 \
+      /tmp/wheels/onnxruntime_gpu-1.15.1-cp38-cp38-linux_aarch64.whl \
+      'onnx>=1.12,<1.18' onnxslim && \
+    python3 -c "import onnxruntime as ort, tensorrt; print(ort.get_available_providers(), tensorrt.__version__)"
+
 WORKDIR /workspace
 COPY yolo_subscriber_node.py /workspace/yolo_subscriber_node.py
 COPY entrypoint.sh /workspace/entrypoint.sh

@@ -1,0 +1,8 @@
+.venv/
+datasets/
+datasets.tar.xz
+notebooks/
+runs/
+.git/
+*.engine
+*.onnx
