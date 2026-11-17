@@ -22,7 +22,10 @@ ROS_DOMAIN_ID="${ROS_DOMAIN_ID:-0}"          # match go2_ws and your zenoh bridg
 # this project's models/ folder) and where it gets mounted inside the
 # container. Override HOST_MODEL_PATH if you want to point at a different
 # .pt file without editing this script.
-HOST_MODEL_PATH="${HOST_MODEL_PATH:-${SCRIPT_DIR}/models/fire_extinguisher_best.pt}"
+
+# HOST_MODEL_PATH="${HOST_MODEL_PATH:-${SCRIPT_DIR}/models/fire_extinguisher_best.pt}"
+HOST_MODEL_PATH="${HOST_MODEL_PATH:-${SCRIPT_DIR}/models/go2_ext_bluebox_best.pt}"
+
 # Mounted under its own file name so the extension (.pt / .engine / .onnx),
 # which ultralytics uses to pick the backend, is preserved.
 CONTAINER_MODEL_PATH="${CONTAINER_MODEL_PATH:-/workspace/$(basename "${HOST_MODEL_PATH}")}"
@@ -93,5 +96,6 @@ docker run -it --rm \
   --name "${CONTAINER_NAME}" \
   -e ROS_DOMAIN_ID="${ROS_DOMAIN_ID}" \
   -v "${HOST_MODEL_PATH}:${CONTAINER_MODEL_PATH}" \
+  -v /home/unitree/go2_yolo_docker/models:/workspace/models \
   "${IMAGE_NAME}" \
   --ros-args "${ROS_ARGS[@]}"
