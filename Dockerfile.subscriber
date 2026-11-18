@@ -102,6 +102,8 @@ RUN --mount=type=bind,source=models,target=/tmp/wheels \
 # NOTE: don't import tensorrt here -- on JetPack 5 its libs (libnvdla_compiler.so etc.)
 # are mounted from the host only at `docker run --runtime nvidia`, not during build.
 
+RUN pip install numpy==1.23.5
+
 WORKDIR /workspace
 COPY yolo_subscriber_node.py /workspace/yolo_subscriber_node.py
 COPY entrypoint.sh /workspace/entrypoint.sh

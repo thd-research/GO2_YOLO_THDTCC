@@ -32,7 +32,7 @@ zenoh side as long as topic names/domain match what the bridge is configured to 
 ## Build
 
 ```bash
-docker build -t go2-yolo:latest .
+docker build -f Dockerfile.subscriber -t go2-yolo:latest .
 ```
 
 ## Run (on the Go2, in your Docker environment)
