@@ -25,8 +25,6 @@ assumed float-meters depth -- neither assumption holds here unmodified):
     and converts accordingly -- getting this wrong silently produces
     target poses ~1000x too far away, with no error thrown anywhere.
 """
-import math
-
 import numpy as np
 import cv2
 
@@ -37,9 +35,9 @@ from rclpy.duration import Duration
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 from sensor_msgs.msg import Image, CompressedImage, CameraInfo
 from vision_msgs.msg import Detection2DArray, Detection2D, ObjectHypothesisWithPose
-from geometry_msgs.msg import PoseStamped
+from geometry_msgs.msg import Pose, PoseStamped
 from cv_bridge import CvBridge
-from tf2_ros import Buffer, TransformListener, LookupException, ExtrapolationException
+from tf2_ros import Buffer, TransformListener, TransformException
 from tf2_geometry_msgs import do_transform_pose
 
 from ultralytics import YOLO
@@ -68,7 +66,17 @@ class YoloSubscriberNode(Node):
         self.declare_parameter('camera_info_topic', '/camera/color/camera_info')
         self.declare_parameter('target_pose_topic', '/yolo/target_pose')
         self.declare_parameter('target_frame', 'map')
-        self.declare_parameter('camera_frame', 'camera_color_optical_frame')
+        # Empty = use the incoming image's header.frame_id (what the camera
+        # driver actually publishes). Set explicitly only to override it.
+        self.declare_parameter('camera_frame', '')
+        # Fast-updating frame (odometry) used for tf2 "time travel": robot
+        # motion is taken from <fixed_frame> at the exact image stamp, and
+        # only the slow <target_frame>-><fixed_frame> correction (AMCL/SLAM)
+        # uses its latest value. Empty = plain lookups, no time travel.
+        self.declare_parameter('fixed_frame', 'odom')
+        # If TF to target_frame fails, still publish the pose expressed in
+        # the camera frame (instead of publishing nothing).
+        self.declare_parameter('publish_in_camera_frame_on_tf_fail', False)
         # Sanity bounds on accepted depth readings (metres). Real sensors
         # regularly return 0 (no return) or nonsense far values at edges/
         # reflective surfaces -- reject rather than publish garbage poses.
@@ -94,6 +102,10 @@ class YoloSubscriberNode(Node):
         target_pose_topic = self.get_parameter('target_pose_topic').value
         self.target_frame = self.get_parameter('target_frame').value
         self.camera_frame = self.get_parameter('camera_frame').value
+        self.fixed_frame = self.get_parameter('fixed_frame').value
+        self.publish_cam_on_fail = self.get_parameter('publish_in_camera_frame_on_tf_fail').value
+        self.tf_ok_logged = False
+        self.tf_frames_logged = False
         self.min_valid_depth_m = self.get_parameter('min_valid_depth_m').value
         self.max_valid_depth_m = self.get_parameter('max_valid_depth_m').value
 
@@ -112,7 +124,11 @@ class YoloSubscriberNode(Node):
         self.camera_info = None
 
         self.tf_buffer = Buffer()
-        self.tf_listener = TransformListener(self.tf_buffer, self)
+        # spin_thread=True: /tf is received on its own thread. Without it,
+        # /tf callbacks share this node's single-threaded executor and can't
+        # run while the (slow) inference callback is blocked waiting on a
+        # lookup -- so the buffer goes stale and every timeout is wasted.
+        self.tf_listener = TransformListener(self.tf_buffer, self, spin_thread=True)
 
         # Two separate QoS profiles: BEST_EFFORT for subscribing (matches
         # the camera driver's conventional sensor-data QoS), and RELIABLE
@@ -149,7 +165,8 @@ class YoloSubscriberNode(Node):
         self.get_logger().info(
             f'3D back-projection: depth_topic={depth_topic}, '
             f'camera_info_topic={camera_info_topic}, target_frame={self.target_frame}, '
-            f'camera_frame={self.camera_frame} -> publishing {target_pose_topic}'
+            f'camera_frame={self.camera_frame or "<image header.frame_id>"}, '
+            f'fixed_frame={self.fixed_frame or "<none>"} -> publishing {target_pose_topic}'
         )
 
     def depth_cb(self, msg: Image):
@@ -222,99 +239,153 @@ class YoloSubscriberNode(Node):
             # re-check class membership here, just take highest confidence.
             if conf > best_conf:
                 best_conf = conf
-                best_box = (cx, cy)
+                best_box = (cx, cy, bw, bh)
 
         self.det_pub.publish(det_array)
 
         if best_box is not None:
             self.publish_target_pose(best_box, header)
 
-    def publish_target_pose(self, pixel, header):
+    def publish_target_pose(self, box, header):
         if self.latest_depth is None or self.camera_info is None:
             return
 
-        cx, cy = pixel
+        cx, cy, bw, bh = box
         px, py = int(cx), int(cy)
 
         depth_img = self.bridge.imgmsg_to_cv2(self.latest_depth, desired_encoding='passthrough')
-        if not (0 <= py < depth_img.shape[0] and 0 <= px < depth_img.shape[1]):
-            return
-
-        raw_val = float(depth_img[py, px])
-        if raw_val <= 0.0 or math.isnan(raw_val) or math.isinf(raw_val):
+        h, w = depth_img.shape[:2]
+        if not (0 <= py < h and 0 <= px < w):
             return
 
         # 16UC1 = integer millimetres (typical RealSense aligned-depth output).
         # 32FC1 = already float metres. Anything else is unexpected -- warn
-        # once rather than silently guessing.
+        # rather than silently guessing.
         encoding = self.latest_depth.encoding
         if encoding == '16UC1':
-            depth_m = raw_val / 1000.0
+            scale = 0.001
         elif encoding == '32FC1':
-            depth_m = raw_val
+            scale = 1.0
         else:
             self.get_logger().warn(
                 f'Unrecognized depth encoding "{encoding}", assuming millimetres. '
                 'Verify this against your actual depth topic if poses look wrong.',
                 throttle_duration_sec=10.0
             )
-            depth_m = raw_val / 1000.0
+            scale = 0.001
 
-        if not (self.min_valid_depth_m <= depth_m <= self.max_valid_depth_m):
+        # Median over a window in the central part of the box instead of a
+        # single pixel: one depth hole (0) or edge pixel exactly at the box
+        # center would otherwise drop or corrupt the pose. Window half-size
+        # is 25% of the box, clamped to [2, 20] px.
+        hx = int(min(max(bw * 0.25, 2), 20))
+        hy = int(min(max(bh * 0.25, 2), 20))
+        roi = depth_img[max(py - hy, 0):min(py + hy + 1, h),
+                        max(px - hx, 0):min(px + hx + 1, w)].astype(np.float32) * scale
+        valid = roi[np.isfinite(roi)
+                    & (roi >= self.min_valid_depth_m)
+                    & (roi <= self.max_valid_depth_m)]
+        if valid.size < 5:
             return
+        depth_m = float(np.median(valid))
 
         fx = self.camera_info.k[0]
         fy = self.camera_info.k[4]
         ppx = self.camera_info.k[2]
         ppy = self.camera_info.k[5]
 
-        x = (px - ppx) * depth_m / fx
-        y = (py - ppy) * depth_m / fy
-        z = depth_m
+        camera_pose = Pose()
+        camera_pose.position.x = (px - ppx) * depth_m / fx
+        camera_pose.position.y = (py - ppy) * depth_m / fy
+        camera_pose.position.z = depth_m
+        camera_pose.orientation.w = 1.0
 
-        camera_pose = PoseStamped()
-        camera_pose.header = header
-        camera_pose.pose.position.x = x
-        camera_pose.pose.position.y = y
-        camera_pose.pose.position.z = z
-        camera_pose.pose.orientation.w = 1.0
-
-        try:
-            transform = self.tf_buffer.lookup_transform(
-                self.target_frame, self.camera_frame, header.stamp,
-                timeout=Duration(seconds=0.5)
-            )
-        except (LookupException, ExtrapolationException) as e:
-            # Exact-timestamp lookup commonly fails here because AMCL only
-            # republishes map->odom periodically (often a few Hz, tied to
-            # scan-matching), while the camera captures at ~8Hz -- so most
-            # image timestamps land ahead of the latest map correction
-            # available. Falling back to the latest available transform
-            # (rclpy.time.Time() == "latest") trades a small timing error
-            # (bounded by AMCL's own update rate) for actually getting a
-            # pose most frames, instead of failing on nearly every one.
-            try:
-                transform = self.tf_buffer.lookup_transform(
-                    self.target_frame, self.camera_frame, rclpy.time.Time(),
-                    timeout=Duration(seconds=0.5)
-                )
-                self.get_logger().warn(
-                    f'Exact-stamp TF lookup failed ({e}); used latest available '
-                    'transform instead -- pose may be off by up to AMCL\'s update '
-                    'interval if the robot is moving quickly.',
-                    throttle_duration_sec=5.0
-                )
-            except (LookupException, ExtrapolationException) as e2:
-                self.get_logger().warn(f'TF lookup failed for YOLO target pose (both exact and latest): {e2}')
-                return
-
-        world_pose_geom = do_transform_pose(camera_pose.pose, transform)
+        cam_frame = self.camera_frame or header.frame_id
+        if not cam_frame:
+            self.get_logger().warn(
+                'Image header has no frame_id and camera_frame param is empty -- '
+                'cannot place the target pose in TF.', throttle_duration_sec=10.0)
+            return
 
         out = PoseStamped()
-        out.header.frame_id = self.target_frame
         out.header.stamp = header.stamp
-        out.pose = world_pose_geom
+
+        transform = self.lookup_camera_to_target(cam_frame, header.stamp)
+        if transform is None:
+            if self.publish_cam_on_fail:
+                out.header.frame_id = cam_frame
+                out.pose = camera_pose
+                self.pose_pub.publish(out)
+            return
+
+        out.header.frame_id = self.target_frame
+        out.pose = do_transform_pose(camera_pose, transform)
         self.pose_pub.publish(out)
+
+    def lookup_camera_to_target(self, cam_frame, stamp):
+        """Return target_frame <- cam_frame at the image time, or None.
+
+        Order of attempts (each with a short timeout -- TF is received on its
+        own thread, so a failure costs ~50 ms, not a blocked executor):
+          1. tf2 "time travel" through fixed_frame (odom): odom<-camera at
+             the exact image stamp (fast odometry, always available), then
+             map<-odom at the latest available time (AMCL/SLAM only updates
+             map->odom at a few Hz, so an exact-stamp map lookup usually
+             fails). Or a plain exact-stamp lookup if no fixed_frame.
+          2. Latest available target<-camera (small timing error while moving).
+        """
+        timeout = Duration(seconds=0.05)
+        stamp_t = rclpy.time.Time.from_msg(stamp)
+        errors = []
+
+        use_time_travel = bool(self.fixed_frame) and \
+            self.fixed_frame not in (self.target_frame, cam_frame)
+        try:
+            if use_time_travel:
+                tf = self.tf_buffer.lookup_transform_full(
+                    target_frame=self.target_frame, target_time=rclpy.time.Time(),
+                    source_frame=cam_frame, source_time=stamp_t,
+                    fixed_frame=self.fixed_frame, timeout=timeout)
+            else:
+                tf = self.tf_buffer.lookup_transform(
+                    self.target_frame, cam_frame, stamp_t, timeout=timeout)
+            self._tf_ok(cam_frame, 'time travel via ' + self.fixed_frame
+                        if use_time_travel else 'exact stamp')
+            return tf
+        except TransformException as e:
+            errors.append(f'{"time-travel" if use_time_travel else "exact"}: {e}')
+
+        try:
+            tf = self.tf_buffer.lookup_transform(
+                self.target_frame, cam_frame, rclpy.time.Time(), timeout=timeout)
+            self.get_logger().warn(
+                f'Exact TF lookup failed ({errors[0]}); used latest available '
+                f'{self.target_frame}<-{cam_frame} instead -- pose may lag if the robot moves fast.',
+                throttle_duration_sec=5.0)
+            self._tf_ok(cam_frame, 'latest')
+            return tf
+        except TransformException as e:
+            errors.append(f'latest: {e}')
+
+        self.tf_ok_logged = False
+        if not self.tf_frames_logged:
+            self.tf_frames_logged = True
+            frames = self.tf_buffer.all_frames_as_string() or '  <no TF frames received at all>'
+            self.get_logger().warn(
+                f'No TF {self.target_frame}<-{cam_frame}. Frames currently known:\n{frames}\n'
+                'Check that /tf and /tf_static reach this container, that something publishes '
+                f'"{self.target_frame}" (SLAM/AMCL for map), and that the camera is linked to the '
+                'robot (static base_link->camera_link). Or set target_frame to an existing frame.')
+        self.get_logger().warn(
+            f'TF lookup failed for YOLO target pose: {" | ".join(errors)}',
+            throttle_duration_sec=5.0)
+        return None
+
+    def _tf_ok(self, cam_frame, method):
+        if not self.tf_ok_logged:
+            self.tf_ok_logged = True
+            self.get_logger().info(
+                f'TF OK: {self.target_frame}<-{cam_frame} ({method}); publishing target poses.')
 
 
 def main(args=None):

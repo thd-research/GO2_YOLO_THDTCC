@@ -98,7 +98,9 @@ RUN --mount=type=bind,source=models,target=/tmp/wheels \
     pip3 install --no-cache-dir --default-timeout=180 --retries 10 \
       /tmp/wheels/onnxruntime_gpu-1.15.1-cp38-cp38-linux_aarch64.whl \
       'onnx>=1.12,<1.18' onnxslim && \
-    python3 -c "import onnxruntime as ort, tensorrt; print(ort.get_available_providers(), tensorrt.__version__)"
+    python3 -c "import onnx, onnxslim, onnxruntime as ort; print('onnx', onnx.__version__, ort.get_available_providers())"
+# NOTE: don't import tensorrt here -- on JetPack 5 its libs (libnvdla_compiler.so etc.)
+# are mounted from the host only at `docker run --runtime nvidia`, not during build.
 
 WORKDIR /workspace
 COPY yolo_subscriber_node.py /workspace/yolo_subscriber_node.py
