@@ -27,11 +27,13 @@ assumed float-meters depth -- neither assumption holds here unmodified):
 """
 import colorsys
 import math
+import time
 import zlib
 from collections import deque
 
 import numpy as np
 import cv2
+import yaml
 
 import rclpy
 import rclpy.time
@@ -49,6 +51,10 @@ from tf2_ros import Buffer, TransformListener, TransformException
 from ultralytics import YOLO
 
 from object_memory import STATIC, DynamicObjectTracker, StaticObjectMemory, load_class_config
+
+TF_FAIL_LIMIT = 10       # consecutive TF failures before the circuit breaker trips
+TF_SKIP_S = 1.0          # ...then skip TF lookups this long (probe once per period)
+TF_DIAG_PERIOD_S = 30.0  # at most one TF diagnosis report per this many seconds
 
 
 def _stamp_s(stamp):
@@ -159,6 +165,17 @@ class YoloSubscriberNode(Node):
         self.declare_parameter('depth_noise_b', 0.004)
         self.declare_parameter('box_px_sigma', 3.0)
 
+        # --- TF robustness ---
+        # Max age (image stamp - transform stamp) accepted for the camera->fixed_frame
+        # hop (odometry, fast) and for the fixed_frame->target_frame hop (SLAM/AMCL,
+        # slow). Older data is rejected instead of silently giving wrong poses.
+        self.declare_parameter('max_tf_age_s', 0.5)
+        self.declare_parameter('max_map_tf_age_s', 5.0)
+
+        # --- instrumentation ---
+        # Log per-stage timing / rates every N seconds. 0 = off.
+        self.declare_parameter('stats_period_s', 10.0)
+
         model_path = self.get_parameter('model_path').value
         self.conf_thres = self.get_parameter('conf_thres').value
         input_topic = self.get_parameter('input_topic').value
@@ -181,7 +198,6 @@ class YoloSubscriberNode(Node):
         self.fixed_frame = self.get_parameter('fixed_frame').value
         self.publish_cam_on_fail = self.get_parameter('publish_in_camera_frame_on_tf_fail').value
         self.tf_ok_logged = False
-        self.tf_frames_logged = False
         self.min_valid_depth_m = self.get_parameter('min_valid_depth_m').value
         self.max_valid_depth_m = self.get_parameter('max_valid_depth_m').value
         object_config = self.get_parameter('object_config').value
@@ -195,7 +211,22 @@ class YoloSubscriberNode(Node):
         self.depth_noise_a = float(self.get_parameter('depth_noise_a').value)
         self.depth_noise_b = float(self.get_parameter('depth_noise_b').value)
         self.box_px_sigma = float(self.get_parameter('box_px_sigma').value)
-        self.prev_cam = None  # (quaternion xyzw in target_frame, stamp_s) for motion gating
+        self.prev_cam = None  # (rotation 3x3 in target_frame, stamp_s) for motion gating
+        self.max_tf_age = float(self.get_parameter('max_tf_age_s').value)
+        self.max_map_tf_age = float(self.get_parameter('max_map_tf_age_s').value)
+        stats_period_s = float(self.get_parameter('stats_period_s').value)
+
+        # TF circuit breaker: after TF_FAIL_LIMIT failures in a row, skip TF
+        # lookups for TF_SKIP_S seconds so a broken TF tree can't slow inference.
+        self.tf_fail_streak = 0
+        self.tf_skip_until = 0.0
+        self.tf_diag_next = 0.0
+        self.tf_diag_hist = {}  # link -> (wall_time, age_s) from the previous diagnosis
+
+        # Per-stage timing: name -> [count, total_s, max_s]; counters: name -> int
+        self.stats = {}
+        self.counters = {}
+        self.stats_t0 = time.monotonic()
 
         self.get_logger().info(f'Loading YOLO model: {model_path}')
         # For real-time speed on Orin Nano, export once to TensorRT and point
@@ -268,20 +299,28 @@ class YoloSubscriberNode(Node):
         self.create_timer(1.0, self.static_timer_cb)
         if self.memory_file:
             self.create_timer(memory_save_period_s, self.save_memory)
+        if stats_period_s > 0:
+            self.create_timer(stats_period_s, self.stats_timer_cb)
 
         # Depth + camera_info: BEST_EFFORT to match the RealSense driver's
         # own publishing convention (same reasoning as sub_qos above).
         self.create_subscription(Image, depth_topic, self.depth_cb, sub_qos)
         self.create_subscription(CameraInfo, camera_info_topic, self.caminfo_cb, sub_qos)
 
+        # Color images: queue depth 1 -- when inference is slower than the
+        # camera, always process the NEWEST frame instead of working through
+        # a backlog (which only adds latency).
+        img_qos = QoSProfile(depth=1)
+        img_qos.reliability = ReliabilityPolicy.BEST_EFFORT
+        img_qos.history = HistoryPolicy.KEEP_LAST
         if self.use_compressed:
             self.get_logger().info(f'Subscribing (compressed) to: {input_topic}')
             self.sub = self.create_subscription(
-                CompressedImage, input_topic, self.compressed_callback, sub_qos)
+                CompressedImage, input_topic, self.compressed_callback, img_qos)
         else:
             self.get_logger().info(f'Subscribing (raw) to: {input_topic}')
             self.sub = self.create_subscription(
-                Image, input_topic, self.image_callback, sub_qos)
+                Image, input_topic, self.image_callback, img_qos)
 
         self.get_logger().info(
             f'3D back-projection: depth_topic={depth_topic}, '
@@ -315,30 +354,75 @@ class YoloSubscriberNode(Node):
         frame = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
         self.run_inference(frame, msg.header)
 
+    # ------------------------------------------------------------ stats
+    def _tick(self, name, seconds):
+        s = self.stats.get(name)
+        if s is None:
+            self.stats[name] = [1, seconds, seconds]
+        else:
+            s[0] += 1
+            s[1] += seconds
+            if seconds > s[2]:
+                s[2] = seconds
+
+    def _count(self, name, n=1):
+        self.counters[name] = self.counters.get(name, 0) + n
+
+    def stats_timer_cb(self):
+        now = time.monotonic()
+        elapsed = max(now - self.stats_t0, 1e-6)
+        frames = self.stats.get('frame', [0])[0]
+        parts = [f'{frames / elapsed:.1f} FPS']
+        for name in ('frame', 'infer', 'draw', '3d', 'tf', 'memory', 'merge', 'save'):
+            s = self.stats.get(name)
+            if s:
+                parts.append(f'{name} {1000 * s[1] / s[0]:.1f}/{1000 * s[2]:.0f}ms')
+        c = self.counters
+        parts.append(f'tf ok {c.get("tf_ok", 0)} fail {c.get("tf_fail", 0)} '
+                     f'skipped {c.get("tf_skipped", 0)}')
+        if c.get('draw_skipped'):
+            parts.append(f'draw skipped {c["draw_skipped"]} (no subscriber)')
+        parts.append(f'objects {len(self.static_memory.instances)} '
+                     f'({len(self.static_memory.confirmed())} confirmed)')
+        self.get_logger().info(f'stats {elapsed:.0f}s (mean/max): ' + ' | '.join(parts))
+        self.stats.clear()
+        self.counters.clear()
+        self.stats_t0 = now
+
+    # ------------------------------------------------------------ inference
     def run_inference(self, frame, header):
+        t_frame = time.perf_counter()
         results = self.model.predict(
             frame, conf=self.conf_thres, classes=self.classes_filter, verbose=False)
         result = results[0]
+        t = time.perf_counter()
+        self._tick('infer', t - t_frame)
 
-        annotated = result.plot()  # BGR numpy array, boxes drawn in
-        annotated = np.ascontiguousarray(annotated, dtype=np.uint8)
+        # Drawing + JPEG costs several ms per frame: only do it when someone
+        # (rviz, rqt, the zenoh bridge) actually subscribes to the image.
+        if self.image_pub.get_subscription_count() > 0:
+            annotated = result.plot()  # BGR numpy array, boxes drawn in
+            annotated = np.ascontiguousarray(annotated, dtype=np.uint8)
 
-        # JPEG-encode directly via cv2 rather than cv_bridge.cv2_to_imgmsg --
-        # avoids a known cv_bridge/opencv-python type-code conflict when the
-        # two coexist (pip-installed opencv-python from ultralytics vs. the
-        # apt/source-built OpenCV cv_bridge itself was compiled against),
-        # and produces a much smaller message for the zenoh bridge to relay.
-        success, encoded = cv2.imencode(
-            '.jpg', annotated, [cv2.IMWRITE_JPEG_QUALITY, self.jpeg_quality]
-        )
-        if success:
-            img_msg = CompressedImage()
-            img_msg.header = header  # keep original timestamp/frame_id
-            img_msg.format = 'jpeg'
-            img_msg.data = encoded.tobytes()
-            self.image_pub.publish(img_msg)
+            # JPEG-encode directly via cv2 rather than cv_bridge.cv2_to_imgmsg --
+            # avoids a known cv_bridge/opencv-python type-code conflict when the
+            # two coexist (pip-installed opencv-python from ultralytics vs. the
+            # apt/source-built OpenCV cv_bridge itself was compiled against),
+            # and produces a much smaller message for the zenoh bridge to relay.
+            success, encoded = cv2.imencode(
+                '.jpg', annotated, [cv2.IMWRITE_JPEG_QUALITY, self.jpeg_quality]
+            )
+            if success:
+                img_msg = CompressedImage()
+                img_msg.header = header  # keep original timestamp/frame_id
+                img_msg.format = 'jpeg'
+                img_msg.data = encoded.tobytes()
+                self.image_pub.publish(img_msg)
+            else:
+                self.get_logger().warn('JPEG encoding failed, skipping this frame\'s debug image')
+            self._tick('draw', time.perf_counter() - t)
         else:
-            self.get_logger().warn('JPEG encoding failed, skipping this frame\'s debug image')
+            self._count('draw_skipped')
 
         det_array = Detection2DArray()
         det_array.header = header
@@ -369,7 +453,10 @@ class YoloSubscriberNode(Node):
         self.det_pub.publish(det_array)
 
         if dets:
+            t = time.perf_counter()
             self.process_3d(dets, header)
+            self._tick('3d', time.perf_counter() - t)
+        self._tick('frame', time.perf_counter() - t_frame)
 
     def process_3d(self, dets, header):
         """Back-project every detection, transform to target_frame once,
@@ -419,16 +506,18 @@ class YoloSubscriberNode(Node):
         out.pose.orientation.w = 1.0
 
         # One TF lookup per frame, shared by all detections.
-        transform = self.lookup_camera_to_target(cam_frame, header.stamp)
-        if transform is None:
+        t = time.perf_counter()
+        tf = self.lookup_camera_to_target(cam_frame, header.stamp)
+        self._tick('tf', time.perf_counter() - t)
+        if tf is None:
             if self.publish_cam_on_fail:
                 out.header.frame_id = cam_frame
                 _set_position(out.pose, cam_pts[best_i][1])
                 self.pose_pub.publish(out)
             return
 
-        rot, trans = _transform_to_rt(transform)
-        moving = self.camera_moving(transform, header.stamp)
+        rot, trans = tf
+        moving = self.camera_moving(rot, header.stamp)
         stamp_s = _stamp_s(header.stamp)
 
         static_dets, dynamic_dets = [], []
@@ -447,7 +536,9 @@ class YoloSubscriberNode(Node):
             if moving:
                 self.get_logger().debug('Camera rotating fast -- skipping static memory update')
             else:
+                t = time.perf_counter()
                 matches = self.static_memory.update_frame(static_dets, stamp_s)
+                self._tick('memory', time.perf_counter() - t)
         self.dynamic_tracker.update_frame(dynamic_dets, stamp_s)
         if dynamic_dets:
             self.publish_dynamic_markers(dynamic_dets, header.stamp)
@@ -490,18 +581,21 @@ class YoloSubscriberNode(Node):
         uu = np.outer(u, u)
         return sigma_lat ** 2 * (np.eye(3) - uu) + sigma_depth ** 2 * uu
 
-    def camera_moving(self, transform, stamp):
-        """True if the camera rotated faster than max_cam_ang_vel since the last frame."""
-        r = transform.transform.rotation
-        q = np.array([r.x, r.y, r.z, r.w])
+    def camera_moving(self, rot, stamp):
+        """True if the camera rotated faster than max_cam_ang_vel since the last frame.
+
+        rot: 3x3 rotation target_frame <- camera at this frame.
+        """
         t = _stamp_s(stamp)
-        prev, self.prev_cam = self.prev_cam, (q, t)
+        prev, self.prev_cam = self.prev_cam, (rot, t)
         if prev is None:
             return False
         dt = t - prev[1]
         if dt <= 1e-3 or dt > 1.0:  # duplicate frame or long gap: can't tell
             return False
-        angle = 2.0 * math.acos(min(abs(float(np.dot(q, prev[0]))), 1.0))
+        # Angle of the relative rotation prev^T * rot.
+        cos_a = (float(np.trace(prev[0].T @ rot)) - 1.0) / 2.0
+        angle = math.acos(max(-1.0, min(1.0, cos_a)))
         return angle / dt > self.max_cam_ang_vel
 
     def depth_scale(self, encoding):
@@ -575,7 +669,10 @@ class YoloSubscriberNode(Node):
     def static_timer_cb(self):
         now = self.get_clock().now()
         self.static_memory.prune_unconfirmed(now.nanoseconds * 1e-9)
-        for kept, removed in self.static_memory.merge_duplicates():
+        t = time.perf_counter()
+        merged = self.static_memory.merge_duplicates()
+        self._tick('merge', time.perf_counter() - t)
+        for kept, removed in merged:
             self.get_logger().info(f'Merged duplicate static object {removed} into {kept}')
         stamp = now.to_msg()
 
@@ -630,7 +727,9 @@ class YoloSubscriberNode(Node):
         if not self.memory_file or not self.static_memory.dirty:
             return
         try:
+            t = time.perf_counter()
             n = self.static_memory.save(self.memory_file, self.target_frame)
+            self._tick('save', time.perf_counter() - t)
             self.get_logger().debug(f'Saved {n} static objects to {self.memory_file}')
         except Exception as e:  # noqa: BLE001
             self.get_logger().error(f'Could not save {self.memory_file}: {e!r}',
@@ -658,63 +757,172 @@ class YoloSubscriberNode(Node):
         return response
 
     def lookup_camera_to_target(self, cam_frame, stamp):
-        """Return target_frame <- cam_frame at the image time, or None.
+        """target_frame <- cam_frame at the image time as (rot 3x3, trans 3), or None.
 
-        Order of attempts (each with a short timeout -- TF is received on its
-        own thread, so a failure costs ~50 ms, not a blocked executor):
-          1. tf2 "time travel" through fixed_frame (odom): odom<-camera at
-             the exact image stamp (fast odometry, always available), then
-             map<-odom at the latest available time (AMCL/SLAM only updates
-             map->odom at a few Hz, so an exact-stamp map lookup usually
-             fails). Or a plain exact-stamp lookup if no fixed_frame.
-          2. Latest available target<-camera (small timing error while moving).
+        Hop by hop instead of one chained lookup, so one slow or stale link
+        can't drag the whole chain back to its "latest common time":
+          hop 1: fixed_frame (odom) <- camera at the exact image stamp
+                 (fallback: that hop's latest, only if at most max_tf_age_s old)
+          hop 2: target_frame (map) <- fixed_frame at its own latest
+                 (only if at most max_map_tf_age_s old; AMCL/SLAM is slow)
+        Without a usable fixed_frame: one hop target <- camera.
+        Only the first attempt waits (20 ms); fallbacks never wait. After
+        TF_FAIL_LIMIT failures in a row, TF is skipped for TF_SKIP_S seconds
+        (detections and images keep running at full rate), then probed again.
         """
-        timeout = Duration(seconds=0.05)
-        stamp_t = rclpy.time.Time.from_msg(stamp)
+        now = time.monotonic()
+        if now < self.tf_skip_until:
+            self._count('tf_skipped')
+            return None
+
+        img_t = rclpy.time.Time.from_msg(stamp)
+        img_s = _stamp_s(stamp)
         errors = []
-
-        use_time_travel = bool(self.fixed_frame) and \
+        result, method = None, ''
+        use_fixed = bool(self.fixed_frame) and \
             self.fixed_frame not in (self.target_frame, cam_frame)
-        try:
-            if use_time_travel:
-                tf = self.tf_buffer.lookup_transform_full(
-                    target_frame=self.target_frame, target_time=rclpy.time.Time(),
-                    source_frame=cam_frame, source_time=stamp_t,
-                    fixed_frame=self.fixed_frame, timeout=timeout)
-            else:
-                tf = self.tf_buffer.lookup_transform(
-                    self.target_frame, cam_frame, stamp_t, timeout=timeout)
-            self._tf_ok(cam_frame, 'time travel via ' + self.fixed_frame
-                        if use_time_travel else 'exact stamp')
-            return tf
-        except TransformException as e:
-            errors.append(f'{"time-travel" if use_time_travel else "exact"}: {e}')
+        if use_fixed:
+            hop1 = self._lookup_hop(self.fixed_frame, cam_frame, img_t, img_s,
+                                    self.max_tf_age, errors, wait=True)
+            hop2 = None if hop1 is None else self._lookup_hop(
+                self.target_frame, self.fixed_frame, None, img_s,
+                self.max_map_tf_age, errors, wait=False)
+            if hop1 is not None and hop2 is not None:
+                (r1, t1, m1), (r2, t2, m2) = hop1, hop2
+                result = (r2 @ r1, r2 @ t1 + t2)
+                method = (f'{self.fixed_frame}<-camera {m1}, '
+                          f'{self.target_frame}<-{self.fixed_frame} {m2}')
+        else:
+            hop = self._lookup_hop(self.target_frame, cam_frame, img_t, img_s,
+                                   self.max_tf_age, errors, wait=True)
+            if hop is not None:
+                result, method = (hop[0], hop[1]), hop[2]
 
-        try:
-            tf = self.tf_buffer.lookup_transform(
-                self.target_frame, cam_frame, rclpy.time.Time(), timeout=timeout)
-            self.get_logger().warn(
-                f'Exact TF lookup failed ({errors[0]}); used latest available '
-                f'{self.target_frame}<-{cam_frame} instead -- pose may lag if the robot moves fast.',
-                throttle_duration_sec=5.0)
-            self._tf_ok(cam_frame, 'latest')
-            return tf
-        except TransformException as e:
-            errors.append(f'latest: {e}')
+        if result is not None:
+            self.tf_fail_streak = 0
+            self._count('tf_ok')
+            self._tf_ok(cam_frame, method)
+            return result
 
         self.tf_ok_logged = False
-        if not self.tf_frames_logged:
-            self.tf_frames_logged = True
-            frames = self.tf_buffer.all_frames_as_string() or '  <no TF frames received at all>'
-            self.get_logger().warn(
-                f'No TF {self.target_frame}<-{cam_frame}. Frames currently known:\n{frames}\n'
-                'Check that /tf and /tf_static reach this container, that something publishes '
-                f'"{self.target_frame}" (SLAM/AMCL for map), and that the camera is linked to the '
-                'robot (static base_link->camera_link). Or set target_frame to an existing frame.')
+        self._count('tf_fail')
+        self.tf_fail_streak += 1
+        if self.tf_fail_streak >= TF_FAIL_LIMIT:
+            # Streak is NOT reset: while TF stays broken, every failed probe
+            # re-trips the breaker immediately.
+            self.tf_skip_until = now + TF_SKIP_S
         self.get_logger().warn(
             f'TF lookup failed for YOLO target pose: {" | ".join(errors)}',
             throttle_duration_sec=5.0)
+        if now >= self.tf_diag_next:
+            self.tf_diag_next = now + TF_DIAG_PERIOD_S
+            self.get_logger().warn(self.tf_diagnosis(cam_frame, img_s, now))
         return None
+
+    def _lookup_hop(self, target, source, t, img_s, max_age, errors, wait):
+        """One TF hop -> (rot, trans, method) or None (reason appended to errors).
+
+        t = image time for an exact lookup (fallback: latest), None = latest only.
+        Latest data is accepted only if at most max_age seconds from the image
+        time; a stamp of 0 means an all-static chain (always valid).
+        """
+        timeout = Duration(seconds=0.02) if wait else Duration()
+        if t is not None:
+            try:
+                tf = self.tf_buffer.lookup_transform(target, source, t, timeout=timeout)
+                rot, trans = _transform_to_rt(tf)
+                return rot, trans, 'exact'
+            except TransformException:
+                timeout = Duration()  # fallbacks never wait
+        try:
+            tf = self.tf_buffer.lookup_transform(target, source, rclpy.time.Time(),
+                                                 timeout=timeout)
+        except TransformException as e:
+            errors.append(f'{target}<-{source}: {e}')
+            return None
+        ts = _stamp_s(tf.header.stamp)
+        age = img_s - ts
+        if ts > 0 and abs(age) > max_age:
+            errors.append(f'{target}<-{source}: newest transform is {age:+.1f} s away from '
+                          f'the image time (limit {max_age:.1f} s)')
+            return None
+        rot, trans = _transform_to_rt(tf)
+        return rot, trans, ('static' if ts == 0 else f'latest ({age * 1000:+.0f} ms)')
+
+    def tf_diagnosis(self, cam_frame, img_s, now):
+        """Human-readable report of the TF links between camera and target_frame.
+
+        For every link: parent -> child, broadcaster, rate, and how old its
+        newest transform is relative to the image. Stale links are flagged;
+        comparing with the previous report tells a clock offset (constant age)
+        from a stopped publisher (age grows with wall time).
+        """
+        try:
+            frames = yaml.safe_load(self.tf_buffer.all_frames_as_yaml()) or {}
+        except Exception as e:  # noqa: BLE001
+            return (f'TF diagnosis unavailable ({e!r}). Known frames:\n'
+                    f'{self.tf_buffer.all_frames_as_string()}')
+        if not frames:
+            return ('TF diagnosis: no TF data received at all -- check that /tf and /tf_static '
+                    'reach this container (zenoh/DDS, ROS_DOMAIN_ID, RMW_IMPLEMENTATION).')
+
+        def chain(frame):
+            links, seen = [], set()
+            while frame in frames and frame not in seen:
+                seen.add(frame)
+                parent = frames[frame].get('parent')
+                links.append((frame, parent))
+                frame = parent
+            return links
+
+        cam_links = chain(cam_frame)
+        tgt_links = chain(self.target_frame)
+        cam_ancestors = {cam_frame} | {p for _, p in cam_links}
+        slow_children = {c for c, _ in chain(self.fixed_frame)} if self.fixed_frame else set()
+
+        lines = [f'TF diagnosis for {self.target_frame} <- {cam_frame}:']
+        if cam_frame not in frames:
+            lines.append(f'  "{cam_frame}" is not in the TF tree (camera driver TF or the '
+                         'static base_link->camera_link transform is missing).')
+        tgt_root = tgt_links[-1][1] if tgt_links else self.target_frame
+        if self.target_frame not in cam_ancestors and tgt_root not in cam_ancestors:
+            cam_root = cam_links[-1][1] if cam_links else cam_frame
+            known = set(frames) | {info.get('parent') for info in frames.values()}
+            if self.target_frame not in known:
+                lines.append(f'  "{self.target_frame}" does not exist -- start SLAM/localization, '
+                             'or use TARGET_FRAME=odom.')
+            else:
+                lines.append(f'  NOT CONNECTED: the camera tree ends at "{cam_root}", '
+                             f'"{self.target_frame}" belongs to the tree rooted at "{tgt_root}".')
+        for child, parent in cam_links + [l for l in tgt_links if l not in cam_links]:
+            info = frames.get(child) or {}
+            newest = float(info.get('most_recent_transform', 0) or 0)
+            who = info.get('broadcaster', '?')
+            if newest == 0:
+                lines.append(f'  {parent} -> {child}: static (by {who})')
+                continue
+            age = img_s - newest
+            limit = self.max_map_tf_age if child in slow_children else self.max_tf_age
+            flag = ''
+            if abs(age) > limit:
+                prev = self.tf_diag_hist.get(child)
+                if prev is None:
+                    hint = ' (next report tells clock offset vs. stopped publisher)'
+                else:
+                    d_wall, d_age = now - prev[0], age - prev[1]
+                    if abs(d_age) < 0.2 * d_wall:
+                        hint = (' -> age stays constant: CLOCK OFFSET between machines '
+                                '(sync clocks with chrony/NTP)')
+                    elif d_age > 0.8 * d_wall:
+                        hint = ' -> age keeps growing: PUBLISHER STOPPED (or the bridge dropped /tf)'
+                    else:
+                        hint = ''
+                flag = f'   <-- STALE{hint}'
+            self.tf_diag_hist[child] = (now, age)
+            rate = float(info.get('rate', 0) or 0)
+            lines.append(f'  {parent} -> {child}: newest {age:+.2f} s before image, by {who}, '
+                         f'{rate:.1f} Hz{flag}')
+        return '\n'.join(lines)
 
     def _tf_ok(self, cam_frame, method):
         if not self.tf_ok_logged:

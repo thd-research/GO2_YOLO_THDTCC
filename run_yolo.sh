@@ -53,6 +53,11 @@ CAMERA_FRAME="${CAMERA_FRAME:-}"
 FIXED_FRAME="${FIXED_FRAME-odom}"
 # true = when TF to TARGET_FRAME fails, publish the pose in the camera frame.
 PUBLISH_CAM_ON_FAIL="${PUBLISH_CAM_ON_FAIL:-false}"
+# Max age of TF data accepted (s): odometry hop / map hop. Older -> rejected, not used.
+MAX_TF_AGE_S="${MAX_TF_AGE_S:-0.5}"
+MAX_MAP_TF_AGE_S="${MAX_MAP_TF_AGE_S:-5.0}"
+# Per-stage timing log period (s); 0.0 = off.
+STATS_PERIOD_S="${STATS_PERIOD_S:-10.0}"
 
 # --- static / dynamic object memory -------------------------------------
 # config/ is mounted from the host, so editing object_classes.yaml only
@@ -96,6 +101,7 @@ echo "  target_frame    = ${TARGET_FRAME}"
 echo "  camera_frame    = ${CAMERA_FRAME:-<image header.frame_id>}"
 echo "  fixed_frame     = ${FIXED_FRAME:-<none>}"
 echo "  publish_in_camera_frame_on_tf_fail = ${PUBLISH_CAM_ON_FAIL}"
+echo "  max_tf_age_s     = ${MAX_TF_AGE_S} (map hop ${MAX_MAP_TF_AGE_S}), stats every ${STATS_PERIOD_S}s"
 echo "  object_config   = ${HOST_CONFIG_DIR} -> ${OBJECT_CONFIG}"
 echo "  memory_file     = ${MEMORY_FILE:-<disabled>} (host dir ${HOST_MEMORY_DIR})"
 echo "  target_class    = ${TARGET_CLASS:-<best detection>}"
@@ -127,6 +133,9 @@ ROS_ARGS=(
   -p "box_px_sigma:=${BOX_PX_SIGMA}"
   -p "depth_noise_a:=${DEPTH_NOISE_A}"
   -p "depth_noise_b:=${DEPTH_NOISE_B}"
+  -p "max_tf_age_s:=${MAX_TF_AGE_S}"
+  -p "max_map_tf_age_s:=${MAX_MAP_TF_AGE_S}"
+  -p "stats_period_s:=${STATS_PERIOD_S}"
 )
 if [ -n "${CLASSES_FILTER}" ]; then
   # Wrap in single quotes so ROS2's YAML-based param parser treats this as
