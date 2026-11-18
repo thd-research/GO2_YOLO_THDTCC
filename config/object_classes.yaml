@@ -23,7 +23,7 @@ classes:
     merge_radius_m: 0.5
     min_observations: 5
     center_offset_m: 0.0       # set to half the box depth (e.g. 0.15 for a 30 cm box)
-  fire_extinguisher:
+  extinguisher:                # must match the model's class name exactly (notebook 01: ['extinguisher', 'blue_box'])
     type: static
     merge_radius_m: 0.4
     min_observations: 5
