@@ -118,6 +118,28 @@ def test_save_load_roundtrip():
     print('  save/load: round trip OK, frame mismatch refused, ids continue')
 
 
+def test_merge_duplicates():
+    mem = StaticObjectMemory(CFG)
+    # Two instances of one object (e.g. second spawned from a bad early estimate).
+    mem.update_frame([('blue_box', (2.0, 1.0, 0.3), 0.9, None)], stamp=0.0)
+    mem.update_frame([('blue_box', (2.6, 1.0, 0.3), 0.9, None)], stamp=0.1)  # > merge radius -> new
+    assert len(mem.instances) == 2
+    mem.instances['blue_box_2'].x = np.array([2.2, 1.0, 0.3])  # estimate converged next to #1
+    assert mem.merge_duplicates() == [('blue_box_1', 'blue_box_2')]
+    assert list(mem.instances) == ['blue_box_1']
+    x = mem.instances['blue_box_1'].x
+    assert 2.0 < x[0] < 2.2 and mem.instances['blue_box_1'].n_obs == 2, x
+
+    # Two objects seen in the SAME frame are never merged, however close.
+    mem = StaticObjectMemory(CFG)
+    mem.update_frame([('blue_box', (2.0, 1.0, 0.3), 0.9, None),
+                      ('blue_box', (2.0, 1.6, 0.3), 0.9, None)], stamp=0.0)
+    for inst in mem.instances.values():
+        inst.x = np.array([2.0, 1.0 + 0.1 * (inst.id == 'blue_box_2'), 0.3])
+    assert mem.merge_duplicates() == [] and len(mem.instances) == 2
+    print('  merge: duplicates fused, co-observed objects kept apart')
+
+
 if __name__ == '__main__':
     tests = [v for k, v in sorted(globals().items()) if k.startswith('test_')]
     failed = 0

@@ -40,6 +40,7 @@ STATIC_DEFAULTS = {
     'reinit_after': 15,             # consecutive rejected measurements -> object moved
     'reinit_spread_m': 0.15,        # ...and those measurements must agree within this
     'center_offset_m': 0.0,         # push the seen surface point this far along the ray (half object depth)
+    'merge_distance_m': 0.3,        # two remembered instances closer than this = duplicates -> fuse
 }
 
 DEFAULT_COV = np.eye(3) * 0.05 ** 2
@@ -99,6 +100,9 @@ class StaticInstance:
         self.last_update = float(stamp)
         self.last_conf = float(conf)
         self._rejected = []  # consecutive rejected (z, R) since the last accepted update
+        # Ids of instances detected in the SAME frame as this one: proof they
+        # are different physical objects, so they are never merged.
+        self.distinct_from = set()
 
     @property
     def position(self):
@@ -166,7 +170,27 @@ class StaticInstance:
             'n_obs': int(self.n_obs), 'n_rejected': int(self.n_rejected),
             'first_seen': float(self.first_seen), 'last_seen': float(self.last_seen),
             'last_conf': round(float(self.last_conf), 3),
+            'distinct_from': sorted(self.distinct_from),
         }
+
+    def absorb(self, other):
+        """Fuse a duplicate instance of the same object into this one.
+
+        Covariance-weighted (information form): the better-known estimate
+        dominates, and the fused uncertainty is smaller than either.
+        """
+        I1, I2 = np.linalg.inv(self.P), np.linalg.inv(other.P)
+        P = np.linalg.inv(I1 + I2)
+        self.x = P @ (I1 @ self.x + I2 @ other.x)
+        self.P = 0.5 * (P + P.T)
+        self.n_obs += other.n_obs
+        self.n_rejected += other.n_rejected
+        self.first_seen = min(self.first_seen, other.first_seen)
+        self.last_seen = max(self.last_seen, other.last_seen)
+        self.last_update = max(self.last_update, other.last_update)
+        self.distinct_from |= other.distinct_from
+        self.distinct_from.discard(self.id)
+        self.distinct_from.discard(other.id)
 
 
 class StaticObjectMemory:
@@ -218,9 +242,51 @@ class StaticObjectMemory:
                 inst = StaticInstance(self._new_id(cls), cls, xyz, conf, stamp, cov)
                 self.instances[inst.id] = inst
                 matched.append((inst, i, True))
+
+        # Instances seen together in one frame are different objects: remember
+        # that so merge_duplicates() never fuses them.
+        ids = [m[0].id for m in matched]
+        for inst, _, _ in matched:
+            inst.distinct_from.update(j for j in ids if j != inst.id)
         if detections:
             self.dirty = True
         return matched
+
+    def merge_duplicates(self):
+        """Fuse same-class instances whose estimates are closer than merge_distance_m.
+
+        Duplicates appear when an early, noisy estimate (or one from a bad TF)
+        spawned a second instance of an object that is already remembered.
+        Never merges instances that were detected in the same frame. Keeps the
+        id of the instance with more observations. Returns [(kept_id, removed_id)].
+        """
+        merged = []
+        changed = True
+        while changed:  # repeat: a fused estimate can move close to a third one
+            changed = False
+            insts = sorted(self.instances.values(), key=lambda s: -s.n_obs)
+            for a_i, a in enumerate(insts):
+                limit = float(self.cfg.params(a.class_name)['merge_distance_m'])
+                for b in insts[a_i + 1:]:
+                    if (b.class_name != a.class_name or b.id in a.distinct_from
+                            or a.id in b.distinct_from):
+                        continue
+                    if _dist(a.position, b.position) <= limit:
+                        a.absorb(b)
+                        del self.instances[b.id]
+                        for other in self.instances.values():  # keep exclusions valid
+                            if b.id in other.distinct_from:
+                                other.distinct_from.discard(b.id)
+                                other.distinct_from.add(a.id)
+                        a.distinct_from.discard(a.id)
+                        merged.append((a.id, b.id))
+                        changed = True
+                        break
+                if changed:
+                    break
+        if merged:
+            self.dirty = True
+        return merged
 
     def is_confirmed(self, inst):
         return inst.n_obs >= int(self.cfg.params(inst.class_name)['min_observations'])
@@ -237,6 +303,8 @@ class StaticObjectMemory:
                 del self.instances[inst_id]
                 removed.append(inst_id)
         if removed:
+            for inst in self.instances.values():  # ids may be reused later
+                inst.distinct_from.difference_update(removed)
             self.dirty = True
         return removed
 
@@ -293,6 +361,7 @@ class StaticObjectMemory:
             inst.n_obs = int(d.get('n_obs', 1))
             inst.n_rejected = int(d.get('n_rejected', 0))
             inst.first_seen = float(d.get('first_seen', inst.last_seen))
+            inst.distinct_from = set(d.get('distinct_from') or [])
             self.instances[inst.id] = inst
             m = re.match(r'^(.*)_(\d+)$', inst.id)
             if m and m.group(1) == cls:

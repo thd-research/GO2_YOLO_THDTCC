@@ -575,6 +575,8 @@ class YoloSubscriberNode(Node):
     def static_timer_cb(self):
         now = self.get_clock().now()
         self.static_memory.prune_unconfirmed(now.nanoseconds * 1e-9)
+        for kept, removed in self.static_memory.merge_duplicates():
+            self.get_logger().info(f'Merged duplicate static object {removed} into {kept}')
         stamp = now.to_msg()
 
         arr = MarkerArray()

@@ -14,6 +14,9 @@
 #   reinit_after: 15            consecutive rejected-but-consistent measurements -> object was moved
 #   reinit_spread_m: 0.15       ...those measurements must agree within this distance
 #   center_offset_m: 0.0        half the object's depth: estimate its center, not the visible face
+#   merge_distance_m: 0.3       two remembered instances closer than this are fused into one
+#                               (never if they were both detected in the same frame).
+#                               Keep it below the real spacing between objects of that class.
 
 default_type: dynamic          # classes not listed below
 
