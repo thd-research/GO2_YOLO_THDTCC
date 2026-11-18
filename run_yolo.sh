@@ -24,7 +24,7 @@ ROS_DOMAIN_ID="${ROS_DOMAIN_ID:-0}"          # match go2_ws and your zenoh bridg
 # .pt file without editing this script.
 
 # HOST_MODEL_PATH="${HOST_MODEL_PATH:-${SCRIPT_DIR}/models/fire_extinguisher_best.pt}"
-HOST_MODEL_PATH="${HOST_MODEL_PATH:-${SCRIPT_DIR}/models/go2_ext_bluebox_best.pt}"
+HOST_MODEL_PATH="${HOST_MODEL_PATH:-${SCRIPT_DIR}/models/go2_ext_bluebox_best.engine}"
 
 # Mounted under its own file name so the extension (.pt / .engine / .onnx),
 # which ultralytics uses to pick the backend, is preserved.
@@ -45,7 +45,14 @@ DEPTH_TOPIC="${DEPTH_TOPIC:-/camera/aligned_depth_to_color/image_raw}"
 CAMERA_INFO_TOPIC="${CAMERA_INFO_TOPIC:-/camera/color/camera_info}"
 TARGET_POSE_TOPIC="${TARGET_POSE_TOPIC:-/yolo/target_pose}"
 TARGET_FRAME="${TARGET_FRAME:-map}"
-CAMERA_FRAME="${CAMERA_FRAME:-camera_color_optical_frame}"
+# Empty = use the image's own header.frame_id (recommended).
+CAMERA_FRAME="${CAMERA_FRAME:-}"
+# Odometry frame for tf2 time-travel lookups (exact image time for robot
+# motion, latest for the slow map->odom correction). FIXED_FRAME= (empty)
+# disables it; unset keeps the default "odom".
+FIXED_FRAME="${FIXED_FRAME-odom}"
+# true = when TF to TARGET_FRAME fails, publish the pose in the camera frame.
+PUBLISH_CAM_ON_FAIL="${PUBLISH_CAM_ON_FAIL:-false}"
 
 if [ ! -f "${HOST_MODEL_PATH}" ]; then
   echo "ERROR: model file not found at ${HOST_MODEL_PATH}"
@@ -65,7 +72,9 @@ echo "  output detections = ${DET_TOPIC}"
 echo "  depth_topic     = ${DEPTH_TOPIC}"
 echo "  camera_info_topic = ${CAMERA_INFO_TOPIC}"
 echo "  target_frame    = ${TARGET_FRAME}"
-echo "  camera_frame    = ${CAMERA_FRAME}"
+echo "  camera_frame    = ${CAMERA_FRAME:-<image header.frame_id>}"
+echo "  fixed_frame     = ${FIXED_FRAME:-<none>}"
+echo "  publish_in_camera_frame_on_tf_fail = ${PUBLISH_CAM_ON_FAIL}"
 echo "  output target_pose = ${TARGET_POSE_TOPIC}"
 
 # Build the -p args array so we only pass classes_filter when it's actually
@@ -81,7 +90,10 @@ ROS_ARGS=(
   -p "camera_info_topic:=${CAMERA_INFO_TOPIC}"
   -p "target_pose_topic:=${TARGET_POSE_TOPIC}"
   -p "target_frame:=${TARGET_FRAME}"
-  -p "camera_frame:=${CAMERA_FRAME}"
+  # Quoted so an empty value is a valid YAML empty string, not a parse error.
+  -p "camera_frame:='${CAMERA_FRAME}'"
+  -p "fixed_frame:='${FIXED_FRAME}'"
+  -p "publish_in_camera_frame_on_tf_fail:=${PUBLISH_CAM_ON_FAIL}"
 )
 if [ -n "${CLASSES_FILTER}" ]; then
   # Wrap in single quotes so ROS2's YAML-based param parser treats this as
