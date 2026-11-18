@@ -86,7 +86,12 @@ def load_class_config(path):
 
 
 class StaticInstance:
-    """One remembered static object: constant-position Kalman filter in 3D."""
+    """One remembered static object: constant-position Kalman filter in 3D.
+
+    `x` and `P` are properties: assigning them refreshes cached derived values
+    (position tuple, eigen-decomposition, sigma) exactly once per change, so
+    readers (association, merge, markers, labels) never recompute them.
+    """
 
     def __init__(self, inst_id, class_name, xyz, conf, stamp, cov=None):
         self.id = inst_id
@@ -101,18 +106,46 @@ class StaticInstance:
         self.last_conf = float(conf)
         self._rejected = []  # consecutive rejected (z, R) since the last accepted update
         # Ids of instances detected in the SAME frame as this one: proof they
-        # are different physical objects, so they are never merged.
+        # are different physical objects, so they are never merged. Symmetric.
         self.distinct_from = set()
+
+    # --- cached state -----------------------------------------------------
+    @property
+    def x(self):
+        return self._x
+
+    @x.setter
+    def x(self, value):
+        self._x = np.asarray(value, dtype=float).reshape(3)
+        self._position = tuple(float(v) for v in self._x)
+
+    @property
+    def P(self):
+        return self._P
+
+    @P.setter
+    def P(self, value):
+        self._P = np.asarray(value, dtype=float).reshape(3, 3)
+        w, V = np.linalg.eigh(self._P)
+        self._eig = (w, V)
+        self._sigma = float(math.sqrt(max(float(w.max()), 0.0)))
 
     @property
     def position(self):
-        return tuple(float(v) for v in self.x)
+        """Estimate as a tuple of plain floats (cached)."""
+        return self._position
 
     @property
     def sigma(self):
-        """1-sigma along the most uncertain axis, metres."""
-        return float(math.sqrt(max(np.linalg.eigvalsh(self.P).max(), 0.0)))
+        """1-sigma along the most uncertain axis, metres (cached)."""
+        return self._sigma
 
+    @property
+    def eig(self):
+        """(eigenvalues, eigenvectors) of P (cached) -- for the uncertainty ellipsoid."""
+        return self._eig
+
+    # --- filter -----------------------------------------------------------
     def update(self, z, R, conf, stamp, p):
         """Fuse one measurement. Returns True if accepted, False if gated out."""
         z = np.asarray(z, dtype=float).reshape(3)
@@ -122,9 +155,9 @@ class StaticInstance:
 
         # Predict: constant position, uncertainty grows slowly while time passes.
         dt = min(max(stamp - self.last_update, 0.0), float(p['max_predict_dt_s']))
-        P = self.P + np.eye(3) * float(p['process_noise']) * dt
+        P = self._P + np.eye(3) * float(p['process_noise']) * dt
 
-        y = z - self.x
+        y = z - self._x
         S = P + R
         d2 = float(y @ np.linalg.solve(S, y))
         if d2 > float(p['gate_chi2']):
@@ -135,10 +168,10 @@ class StaticInstance:
             return False
 
         K = P @ np.linalg.inv(S)
-        self.x = self.x + K @ y
+        self.x = self._x + K @ y
         I_K = np.eye(3) - K
-        self.P = I_K @ P @ I_K.T + K @ R @ K.T  # Joseph form: stays symmetric PSD
-        self.P = 0.5 * (self.P + self.P.T)
+        P_new = I_K @ P @ I_K.T + K @ R @ K.T  # Joseph form: stays symmetric PSD
+        self.P = 0.5 * (P_new + P_new.T)
         self.n_obs += 1
         self.last_update = stamp
         self.last_conf = float(conf)
@@ -159,12 +192,12 @@ class StaticInstance:
             self._rejected = self._rejected[-(len(self._rejected) // 2):]
 
     def to_dict(self):
-        P = self.P
+        P = self._P
         return {
             'id': self.id, 'class': self.class_name,
-            'x': round(float(self.x[0]), 4), 'y': round(float(self.x[1]), 4),
-            'z': round(float(self.x[2]), 4),
-            'sigma_m': round(self.sigma, 4),
+            'x': round(self._position[0], 4), 'y': round(self._position[1], 4),
+            'z': round(self._position[2], 4),
+            'sigma_m': round(self._sigma, 4),
             'cov': [round(float(v), 8) for v in
                     (P[0, 0], P[0, 1], P[0, 2], P[1, 1], P[1, 2], P[2, 2])],
             'n_obs': int(self.n_obs), 'n_rejected': int(self.n_rejected),
@@ -179,9 +212,9 @@ class StaticInstance:
         Covariance-weighted (information form): the better-known estimate
         dominates, and the fused uncertainty is smaller than either.
         """
-        I1, I2 = np.linalg.inv(self.P), np.linalg.inv(other.P)
+        I1, I2 = np.linalg.inv(self._P), np.linalg.inv(other._P)
         P = np.linalg.inv(I1 + I2)
-        self.x = P @ (I1 @ self.x + I2 @ other.x)
+        self.x = P @ (I1 @ self._x + I2 @ other._x)
         self.P = 0.5 * (P + P.T)
         self.n_obs += other.n_obs
         self.n_rejected += other.n_rejected
@@ -196,9 +229,37 @@ class StaticInstance:
 class StaticObjectMemory:
     def __init__(self, class_config):
         self.cfg = class_config
-        self.instances = {}        # id -> StaticInstance
+        self.instances = {}        # id -> StaticInstance (all classes)
+        self._by_class = {}        # class_name -> {id: StaticInstance}
         self._next_index = {}      # class_name -> next integer suffix
+        # Ids created/updated since the last merge_duplicates(): only these can
+        # have become duplicates, so the merge only checks them.
+        self._touched = set()
         self.dirty = False
+
+    # ------------------------------------------------------------ index
+    def _add(self, inst):
+        self.instances[inst.id] = inst
+        self._by_class.setdefault(inst.class_name, {})[inst.id] = inst
+        self._touched.add(inst.id)
+
+    def _remove(self, inst_id):
+        """Remove an instance and its id from its partners' distinct_from (symmetric)."""
+        inst = self.instances.pop(inst_id)
+        self._by_class[inst.class_name].pop(inst_id, None)
+        self._touched.discard(inst_id)
+        for pid in inst.distinct_from:
+            partner = self.instances.get(pid)
+            if partner is not None:
+                partner.distinct_from.discard(inst_id)
+        return inst
+
+    def _class_arrays(self, cls):
+        """(list of instances, Nx3 array of their positions) for one class."""
+        insts = list(self._by_class.get(cls, {}).values())
+        if not insts:
+            return insts, np.empty((0, 3))
+        return insts, np.array([inst._position for inst in insts])
 
     # ------------------------------------------------------------ update
     def update_frame(self, detections, stamp):
@@ -207,6 +268,8 @@ class StaticObjectMemory:
         detections: list of (class_name, (x, y, z), conf, cov3x3_or_None) in the memory frame.
         Greedy one-to-one assignment, nearest pairs first, per class: two
         boxes in the same frame can never collapse into one instance.
+        All detection-to-instance distances of a class are computed in one
+        vectorized numpy operation.
         Returns a list of (StaticInstance, detection_index, accepted).
         """
         matched = []
@@ -217,37 +280,41 @@ class StaticObjectMemory:
         for cls, det_idx in by_class.items():
             p = self.cfg.params(cls)
             radius = float(p['merge_radius_m'])
-            candidates = [inst for inst in self.instances.values() if inst.class_name == cls]
-            pairs = []
-            for i in det_idx:
-                for inst in candidates:
-                    d = _dist(detections[i][1], inst.position)
-                    if d <= radius:
-                        pairs.append((d, i, inst.id))
-            pairs.sort()
-            used_det, used_inst = set(), set()
-            for _, i, inst_id in pairs:
-                if i in used_det or inst_id in used_inst:
-                    continue
-                used_det.add(i)
-                used_inst.add(inst_id)
-                inst = self.instances[inst_id]
-                _, xyz, conf, cov = _unpack(detections[i])
-                accepted = inst.update(xyz, cov, conf, stamp, p)
-                matched.append((inst, i, accepted))
-            for i in det_idx:
-                if i in used_det:
+            insts, X = self._class_arrays(cls)
+            used_det = set()
+            if insts:
+                Z = np.array([detections[i][1] for i in det_idx], dtype=float)
+                D = np.linalg.norm(Z[:, None, :] - X[None, :, :], axis=2)  # (dets, insts)
+                rows, cols = np.nonzero(D <= radius)
+                order = np.argsort(D[rows, cols], kind='stable')
+                used_inst = set()
+                for k in order:
+                    r, c = int(rows[k]), int(cols[k])
+                    if r in used_det or c in used_inst:
+                        continue
+                    used_det.add(r)
+                    used_inst.add(c)
+                    inst = insts[c]
+                    i = det_idx[r]
+                    _, xyz, conf, cov = _unpack(detections[i])
+                    accepted = inst.update(xyz, cov, conf, stamp, p)
+                    if accepted:
+                        self._touched.add(inst.id)
+                    matched.append((inst, i, accepted))
+            for r, i in enumerate(det_idx):
+                if r in used_det:
                     continue
                 _, xyz, conf, cov = _unpack(detections[i])
                 inst = StaticInstance(self._new_id(cls), cls, xyz, conf, stamp, cov)
-                self.instances[inst.id] = inst
+                self._add(inst)
                 matched.append((inst, i, True))
 
         # Instances seen together in one frame are different objects: remember
-        # that so merge_duplicates() never fuses them.
-        ids = [m[0].id for m in matched]
-        for inst, _, _ in matched:
-            inst.distinct_from.update(j for j in ids if j != inst.id)
+        # that (symmetrically) so merge_duplicates() never fuses them.
+        if len(matched) > 1:
+            ids = [m[0].id for m in matched]
+            for inst, _, _ in matched:
+                inst.distinct_from.update(j for j in ids if j != inst.id)
         if detections:
             self.dirty = True
         return matched
@@ -258,32 +325,45 @@ class StaticObjectMemory:
         Duplicates appear when an early, noisy estimate (or one from a bad TF)
         spawned a second instance of an object that is already remembered.
         Never merges instances that were detected in the same frame. Keeps the
-        id of the instance with more observations. Returns [(kept_id, removed_id)].
+        id of the instance with more observations (the older one on a tie).
+
+        Incremental: only instances created or moved since the last call are
+        checked (each against its class in one vectorized distance op), and a
+        merged instance is re-queued since its fused position moved. Cost is
+        O(touched x class size) instead of rescanning all pairs after every
+        merge. Returns [(kept_id, removed_id)].
         """
         merged = []
-        changed = True
-        while changed:  # repeat: a fused estimate can move close to a third one
-            changed = False
-            insts = sorted(self.instances.values(), key=lambda s: -s.n_obs)
-            for a_i, a in enumerate(insts):
-                limit = float(self.cfg.params(a.class_name)['merge_distance_m'])
-                for b in insts[a_i + 1:]:
-                    if (b.class_name != a.class_name or b.id in a.distinct_from
-                            or a.id in b.distinct_from):
-                        continue
-                    if _dist(a.position, b.position) <= limit:
-                        a.absorb(b)
-                        del self.instances[b.id]
-                        for other in self.instances.values():  # keep exclusions valid
-                            if b.id in other.distinct_from:
-                                other.distinct_from.discard(b.id)
-                                other.distinct_from.add(a.id)
-                        a.distinct_from.discard(a.id)
-                        merged.append((a.id, b.id))
-                        changed = True
-                        break
-                if changed:
+        queue = list(self._touched)
+        self._touched = set()
+        while queue:
+            a = self.instances.get(queue.pop())
+            if a is None:
+                continue  # already merged away
+            limit = float(self.cfg.params(a.class_name)['merge_distance_m'])
+            insts, X = self._class_arrays(a.class_name)
+            if len(insts) < 2:
+                continue
+            d = np.linalg.norm(X - np.asarray(a._position), axis=1)
+            for j in np.argsort(d):
+                if d[j] > limit:
                     break
+                b = insts[int(j)]
+                if b is a or b.id in a.distinct_from:
+                    continue
+                # Keep the better-observed instance; on a tie, the older one.
+                a_rank, b_rank = (a.n_obs, -a.first_seen), (b.n_obs, -b.first_seen)
+                keep, drop = (a, b) if a_rank >= b_rank else (b, a)
+                partners = set(drop.distinct_from)
+                keep.absorb(drop)
+                self._remove(drop.id)
+                for pid in partners:  # partners of the removed id now exclude the keeper
+                    partner = self.instances.get(pid)
+                    if partner is not None and partner is not keep:
+                        partner.distinct_from.add(keep.id)
+                merged.append((keep.id, drop.id))
+                queue.append(keep.id)  # fused position moved: check it again
+                break
         if merged:
             self.dirty = True
         return merged
@@ -300,26 +380,29 @@ class StaticObjectMemory:
         for inst_id, inst in list(self.instances.items()):
             timeout = float(self.cfg.params(inst.class_name)['unconfirmed_timeout_s'])
             if not self.is_confirmed(inst) and now - inst.last_seen > timeout:
-                del self.instances[inst_id]
+                self._remove(inst_id)
                 removed.append(inst_id)
         if removed:
-            for inst in self.instances.values():  # ids may be reused later
-                inst.distinct_from.difference_update(removed)
             self.dirty = True
         return removed
 
     def nearest_confirmed(self, class_name, xyz, max_dist=float('inf')):
-        best, best_d = None, max_dist
-        for inst in self.confirmed():
-            if inst.class_name == class_name:
-                d = _dist(inst.position, xyz)
-                if d <= best_d:
-                    best, best_d = inst, d
-        return best
+        insts, X = self._class_arrays(class_name)
+        if not insts:
+            return None
+        d = np.linalg.norm(X - np.asarray(xyz, dtype=float), axis=1)
+        for j in np.argsort(d):
+            if d[j] > max_dist:
+                return None
+            if self.is_confirmed(insts[int(j)]):
+                return insts[int(j)]
+        return None
 
     def clear(self):
         self.instances.clear()
+        self._by_class.clear()
         self._next_index.clear()
+        self._touched.clear()
         self.dirty = True
 
     # ------------------------------------------------------- persistence
@@ -362,7 +445,7 @@ class StaticObjectMemory:
             inst.n_rejected = int(d.get('n_rejected', 0))
             inst.first_seen = float(d.get('first_seen', inst.last_seen))
             inst.distinct_from = set(d.get('distinct_from') or [])
-            self.instances[inst.id] = inst
+            self._add(inst)  # also queued for merge_duplicates()
             m = re.match(r'^(.*)_(\d+)$', inst.id)
             if m and m.group(1) == cls:
                 self._next_index[cls] = max(self._next_index.get(cls, 1), int(m.group(2)) + 1)
@@ -412,6 +495,3 @@ def _as_cov(cov):
     c = 0.5 * (c + c.T)
     return c + np.eye(3) * 1e-8  # keep it invertible
 
-
-def _dist(a, b):
-    return math.sqrt(sum((float(a[i]) - float(b[i])) ** 2 for i in range(3)))

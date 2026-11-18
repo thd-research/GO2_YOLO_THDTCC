@@ -599,7 +599,8 @@ class YoloSubscriberNode(Node):
 
     def uncertainty_marker(self, mid, inst, color, stamp):
         """2-sigma ellipsoid of the instance's Kalman covariance."""
-        w, V = np.linalg.eigh(inst.P)
+        w, V = inst.eig  # cached at the last filter update
+        V = V.copy()      # don't modify the cached eigenvectors below
         if np.linalg.det(V) < 0:
             V[:, 2] *= -1  # keep a right-handed rotation
         m = self.make_marker('static_uncertainty', mid, Marker.SPHERE, inst.position,

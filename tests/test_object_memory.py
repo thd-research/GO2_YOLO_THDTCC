@@ -140,6 +140,41 @@ def test_merge_duplicates():
     print('  merge: duplicates fused, co-observed objects kept apart')
 
 
+def test_merge_is_incremental_and_chains():
+    mem = StaticObjectMemory(CFG)
+    # Three copies of one object, created in separate frames, spaced 0.6 m apart
+    # (beyond the association radius), then their estimates drift together.
+    for k, y in enumerate((0.0, 0.6, 1.2)):
+        mem.update_frame([('blue_box', (2.0, y, 0.3), 0.9, None)], stamp=k * 0.1)
+    for inst, y in zip(sorted(mem.instances.values(), key=lambda s: s.id), (0.0, 0.15, 0.3)):
+        inst.x = np.array([2.0, y, 0.3])
+    merged = mem.merge_duplicates()
+    assert len(merged) == 2 and len(mem.instances) == 1, (merged, list(mem.instances))
+    survivor = next(iter(mem.instances.values()))
+    assert survivor.n_obs == 3 and abs(survivor.x[1] - 0.15) < 0.05, survivor.x
+    # Nothing new since the last call -> nothing to check, nothing merged.
+    assert mem.merge_duplicates() == []
+    assert not mem._touched
+    # Index stays consistent with the instance dict.
+    assert list(mem._by_class['blue_box']) == list(mem.instances)
+    print('  merge: chained duplicates fused in one call, idle call is a no-op')
+
+
+def test_cached_values_follow_updates():
+    rng = np.random.default_rng(4)
+    mem = StaticObjectMemory(CFG)
+    truth = np.array([1.5, 0.5, 0.2])
+    for k in range(30):
+        xyz, R = measurement(rng, truth, np.zeros(3))
+        mem.update_frame([('blue_box', xyz, 0.9, R)], stamp=k * 0.1)
+    inst = mem.instances['blue_box_1']
+    assert inst.position == tuple(float(v) for v in inst.x)
+    w, _ = inst.eig
+    assert np.allclose(np.sort(w), np.sort(np.linalg.eigvalsh(inst.P)))
+    assert abs(inst.sigma - np.sqrt(np.linalg.eigvalsh(inst.P).max())) < 1e-12
+    print('  cache: position / eig / sigma match the live filter state')
+
+
 if __name__ == '__main__':
     tests = [v for k, v in sorted(globals().items()) if k.startswith('test_')]
     failed = 0
