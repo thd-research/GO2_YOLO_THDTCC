@@ -86,20 +86,22 @@ class StaticInstance:
         self.add(xyz, conf, stamp)
 
     def add(self, xyz, conf, stamp):
-        self.samples.append(tuple(xyz))
+        # Force plain Python floats: tf2_geometry_msgs returns numpy.float64
+        # coordinates, which yaml.safe_dump cannot serialize.
+        self.samples.append(tuple(float(v) for v in xyz))
         self.n_obs += 1
-        self.last_seen = stamp
-        self.last_conf = conf
+        self.last_seen = float(stamp)
+        self.last_conf = float(conf)
         # Per-axis median of recent samples: robust to depth spikes / edges.
         self.position = tuple(_median([s[i] for s in self.samples]) for i in range(3))
 
     def to_dict(self):
         return {
             'id': self.id, 'class': self.class_name,
-            'x': round(self.position[0], 4), 'y': round(self.position[1], 4),
-            'z': round(self.position[2], 4),
-            'n_obs': self.n_obs, 'first_seen': self.first_seen,
-            'last_seen': self.last_seen, 'last_conf': round(self.last_conf, 3),
+            'x': round(float(self.position[0]), 4), 'y': round(float(self.position[1]), 4),
+            'z': round(float(self.position[2]), 4),
+            'n_obs': int(self.n_obs), 'first_seen': float(self.first_seen),
+            'last_seen': float(self.last_seen), 'last_conf': round(float(self.last_conf), 3),
         }
 
 
