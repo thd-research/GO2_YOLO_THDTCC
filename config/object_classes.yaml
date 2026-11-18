@@ -1,0 +1,20 @@
+# Static vs dynamic object classes for yolo_subscriber_node.
+# Keys are class NAMES as the model reports them (logged at node startup).
+# The memory frame is the node's target_frame (TARGET_FRAME in run_yolo.sh):
+# use "map" for real use; "odom" only for testing (odometry drift smears positions).
+
+default_type: dynamic          # classes not listed below
+
+classes:
+  blue_box:
+    type: static
+    merge_radius_m: 0.5        # detection within this distance of a known instance = same object
+    min_observations: 5        # frames before an instance is confirmed / published
+    max_samples: 30            # remembered position = median of the last N observations
+    unconfirmed_timeout_s: 10  # forget instances never confirmed within this time
+  fire_extinguisher:
+    type: static
+    merge_radius_m: 0.4
+    min_observations: 5
+  person:
+    type: dynamic              # placeholder: shown per-frame only, no memory yet

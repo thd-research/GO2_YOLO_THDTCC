@@ -6,3 +6,4 @@ runs/
 .git/
 *.engine
 *.onnx
+memory/

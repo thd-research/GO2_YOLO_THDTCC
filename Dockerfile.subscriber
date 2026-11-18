@@ -106,6 +106,8 @@ RUN pip install numpy==1.23.5
 
 WORKDIR /workspace
 COPY yolo_subscriber_node.py /workspace/yolo_subscriber_node.py
+COPY object_memory.py /workspace/object_memory.py
+COPY config/ /workspace/config/
 COPY entrypoint.sh /workspace/entrypoint.sh
 RUN chmod +x /workspace/entrypoint.sh
 

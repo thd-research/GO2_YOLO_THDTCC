@@ -25,6 +25,9 @@ assumed float-meters depth -- neither assumption holds here unmodified):
     and converts accordingly -- getting this wrong silently produces
     target poses ~1000x too far away, with no error thrown anywhere.
 """
+import colorsys
+import zlib
+
 import numpy as np
 import cv2
 
@@ -36,11 +39,15 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 from sensor_msgs.msg import Image, CompressedImage, CameraInfo
 from vision_msgs.msg import Detection2DArray, Detection2D, ObjectHypothesisWithPose
 from geometry_msgs.msg import Pose, PoseStamped
+from visualization_msgs.msg import Marker, MarkerArray
+from std_srvs.srv import Trigger
 from cv_bridge import CvBridge
 from tf2_ros import Buffer, TransformListener, TransformException
 from tf2_geometry_msgs import do_transform_pose
 
 from ultralytics import YOLO
+
+from object_memory import STATIC, DynamicObjectTracker, StaticObjectMemory, load_class_config
 
 
 class YoloSubscriberNode(Node):
@@ -83,6 +90,21 @@ class YoloSubscriberNode(Node):
         self.declare_parameter('min_valid_depth_m', 0.15)
         self.declare_parameter('max_valid_depth_m', 8.0)
 
+        # --- static / dynamic object memory ---
+        # YAML marking each class static (remembered, stable ids) or dynamic
+        # (placeholder). See config/object_classes.yaml. Memory frame =
+        # target_frame. Empty/missing file = every class dynamic.
+        self.declare_parameter('object_config', '')
+        # Where remembered static objects are saved/loaded. Empty = no persistence.
+        self.declare_parameter('memory_file', '')
+        self.declare_parameter('memory_save_period_s', 10.0)
+        # Empty = /yolo/target_pose is the best detection of this frame (old
+        # behavior). Set to a static class name = the remembered position of
+        # the nearest confirmed instance of that class (stable, no jumping).
+        self.declare_parameter('target_class', '')
+        self.declare_parameter('static_objects_topic', '/yolo/static_objects')
+        self.declare_parameter('dynamic_objects_topic', '/yolo/dynamic_objects')
+
         model_path = self.get_parameter('model_path').value
         self.conf_thres = self.get_parameter('conf_thres').value
         input_topic = self.get_parameter('input_topic').value
@@ -108,6 +130,12 @@ class YoloSubscriberNode(Node):
         self.tf_frames_logged = False
         self.min_valid_depth_m = self.get_parameter('min_valid_depth_m').value
         self.max_valid_depth_m = self.get_parameter('max_valid_depth_m').value
+        object_config = self.get_parameter('object_config').value
+        self.memory_file = self.get_parameter('memory_file').value
+        memory_save_period_s = float(self.get_parameter('memory_save_period_s').value)
+        self.target_class = self.get_parameter('target_class').value
+        static_objects_topic = self.get_parameter('static_objects_topic').value
+        dynamic_objects_topic = self.get_parameter('dynamic_objects_topic').value
 
         self.get_logger().info(f'Loading YOLO model: {model_path}')
         # For real-time speed on Orin Nano, export once to TensorRT and point
@@ -119,6 +147,27 @@ class YoloSubscriberNode(Node):
             f'Class filter: {self.classes_filter if self.classes_filter else "all classes"}'
         )
         self.bridge = CvBridge()
+
+        # --- static / dynamic object memory ---
+        self.class_cfg, cfg_found = load_class_config(object_config)
+        summary, unknown = self.class_cfg.describe(self.model.names)
+        self.get_logger().info(
+            f'Object classes ({object_config if cfg_found else "no config file -> all " + self.class_cfg.default_type}):\n{summary}')
+        if object_config and not cfg_found:
+            self.get_logger().warn(f'object_config "{object_config}" not found')
+        if unknown:
+            self.get_logger().warn(f'Config classes not in the model (typo?): {unknown}')
+        self.static_memory = StaticObjectMemory(self.class_cfg)
+        self.dynamic_tracker = DynamicObjectTracker(self.class_cfg)
+        if self.memory_file:
+            try:
+                n, err = self.static_memory.load(self.memory_file, self.target_frame)
+                if err:
+                    self.get_logger().warn(err)
+                else:
+                    self.get_logger().info(f'Loaded {n} static objects from {self.memory_file}')
+            except Exception as e:  # noqa: BLE001 -- a bad file must not kill the node
+                self.get_logger().error(f'Could not load {self.memory_file}: {e!r}')
 
         self.latest_depth = None
         self.camera_info = None
@@ -147,6 +196,16 @@ class YoloSubscriberNode(Node):
         self.image_pub = self.create_publisher(CompressedImage, image_topic, pub_qos)
         self.det_pub = self.create_publisher(Detection2DArray, det_topic, pub_qos)
         self.pose_pub = self.create_publisher(PoseStamped, target_pose_topic, pub_qos)
+        self.static_pub = self.create_publisher(MarkerArray, static_objects_topic, pub_qos)
+        self.dynamic_pub = self.create_publisher(MarkerArray, dynamic_objects_topic, pub_qos)
+
+        self.create_service(Trigger, '~/clear_static_memory', self.srv_clear_memory)
+        self.create_service(Trigger, '~/save_static_memory', self.srv_save_memory)
+        # Static markers are republished at 1 Hz even with nothing in view,
+        # so rviz keeps showing remembered objects.
+        self.create_timer(1.0, self.static_timer_cb)
+        if self.memory_file:
+            self.create_timer(memory_save_period_s, self.save_memory)
 
         # Depth + camera_info: BEST_EFFORT to match the RealSense driver's
         # own publishing convention (same reasoning as sub_qos above).
@@ -214,8 +273,7 @@ class YoloSubscriberNode(Node):
         det_array = Detection2DArray()
         det_array.header = header
 
-        best_box = None
-        best_conf = 0.0
+        dets = []  # (class_name, (cx, cy, bw, bh), conf) -- ALL detections, not only the best
 
         for box in result.boxes:
             cx, cy, bw, bh = box.xywh[0].tolist()
@@ -235,44 +293,100 @@ class YoloSubscriberNode(Node):
             det_array.detections.append(det)
 
             # result.boxes is already restricted to classes_filter by the
-            # `classes=` arg passed to model.predict() above -- no need to
-            # re-check class membership here, just take highest confidence.
-            if conf > best_conf:
-                best_conf = conf
-                best_box = (cx, cy, bw, bh)
+            # `classes=` arg passed to model.predict() above.
+            dets.append((self.model.names[cls_id], (cx, cy, bw, bh), conf))
 
         self.det_pub.publish(det_array)
 
-        if best_box is not None:
-            self.publish_target_pose(best_box, header)
+        if dets:
+            self.process_3d(dets, header)
 
-    def publish_target_pose(self, box, header):
+    def process_3d(self, dets, header):
+        """Back-project every detection, transform to target_frame once,
+        route static classes to the memory and dynamic ones to the tracker,
+        and publish /yolo/target_pose."""
         if self.latest_depth is None or self.camera_info is None:
             return
 
-        cx, cy, bw, bh = box
-        px, py = int(cx), int(cy)
-
         depth_img = self.bridge.imgmsg_to_cv2(self.latest_depth, desired_encoding='passthrough')
-        h, w = depth_img.shape[:2]
-        if not (0 <= py < h and 0 <= px < w):
+        scale = self.depth_scale(self.latest_depth.encoding)
+
+        cam_pts = []  # (class_name, Pose in camera frame, conf)
+        for cls_name, box, conf in dets:
+            pose = self.pixel_to_camera_pose(box, depth_img, scale)
+            if pose is not None:
+                cam_pts.append((cls_name, pose, conf))
+        if not cam_pts:
             return
 
+        cam_frame = self.camera_frame or header.frame_id
+        if not cam_frame:
+            self.get_logger().warn(
+                'Image header has no frame_id and camera_frame param is empty -- '
+                'cannot place detections in TF.', throttle_duration_sec=10.0)
+            return
+
+        best = max(cam_pts, key=lambda d: d[2])
+        out = PoseStamped()
+        out.header.stamp = header.stamp
+
+        # One TF lookup per frame, shared by all detections.
+        transform = self.lookup_camera_to_target(cam_frame, header.stamp)
+        if transform is None:
+            if self.publish_cam_on_fail:
+                out.header.frame_id = cam_frame
+                out.pose = best[1]
+                self.pose_pub.publish(out)
+            return
+
+        stamp_s = header.stamp.sec + header.stamp.nanosec * 1e-9
+        static_dets, dynamic_dets = [], []
+        for cls_name, pose, conf in cam_pts:
+            p = do_transform_pose(pose, transform).position
+            d = (cls_name, (p.x, p.y, p.z), conf)
+            (static_dets if self.class_cfg.type_of(cls_name) == STATIC else dynamic_dets).append(d)
+
+        self.static_memory.update_frame(static_dets, stamp_s)
+        self.dynamic_tracker.update_frame(dynamic_dets, stamp_s)
+        if dynamic_dets:
+            self.publish_dynamic_markers(dynamic_dets, header.stamp)
+
+        out.header.frame_id = self.target_frame
+        if self.target_class:
+            # Stable target: remembered position of the confirmed instance of
+            # target_class nearest to the camera right now.
+            t = transform.transform.translation
+            inst = self.static_memory.nearest_confirmed(self.target_class, (t.x, t.y, t.z))
+            if inst is None:
+                return
+            out.pose.position.x, out.pose.position.y, out.pose.position.z = inst.position
+            out.pose.orientation.w = 1.0
+        else:
+            out.pose = do_transform_pose(best[1], transform)
+        self.pose_pub.publish(out)
+
+    def depth_scale(self, encoding):
         # 16UC1 = integer millimetres (typical RealSense aligned-depth output).
         # 32FC1 = already float metres. Anything else is unexpected -- warn
         # rather than silently guessing.
-        encoding = self.latest_depth.encoding
         if encoding == '16UC1':
-            scale = 0.001
-        elif encoding == '32FC1':
-            scale = 1.0
-        else:
-            self.get_logger().warn(
-                f'Unrecognized depth encoding "{encoding}", assuming millimetres. '
-                'Verify this against your actual depth topic if poses look wrong.',
-                throttle_duration_sec=10.0
-            )
-            scale = 0.001
+            return 0.001
+        if encoding == '32FC1':
+            return 1.0
+        self.get_logger().warn(
+            f'Unrecognized depth encoding "{encoding}", assuming millimetres. '
+            'Verify this against your actual depth topic if poses look wrong.',
+            throttle_duration_sec=10.0
+        )
+        return 0.001
+
+    def pixel_to_camera_pose(self, box, depth_img, scale):
+        """Box (cx, cy, bw, bh) in pixels -> Pose in the camera optical frame, or None."""
+        cx, cy, bw, bh = box
+        px, py = int(cx), int(cy)
+        h, w = depth_img.shape[:2]
+        if not (0 <= py < h and 0 <= px < w):
+            return None
 
         # Median over a window in the central part of the box instead of a
         # single pixel: one depth hole (0) or edge pixel exactly at the box
@@ -286,7 +400,7 @@ class YoloSubscriberNode(Node):
                     & (roi >= self.min_valid_depth_m)
                     & (roi <= self.max_valid_depth_m)]
         if valid.size < 5:
-            return
+            return None
         depth_m = float(np.median(valid))
 
         fx = self.camera_info.k[0]
@@ -299,28 +413,98 @@ class YoloSubscriberNode(Node):
         camera_pose.position.y = (py - ppy) * depth_m / fy
         camera_pose.position.z = depth_m
         camera_pose.orientation.w = 1.0
+        return camera_pose
 
-        cam_frame = self.camera_frame or header.frame_id
-        if not cam_frame:
-            self.get_logger().warn(
-                'Image header has no frame_id and camera_frame param is empty -- '
-                'cannot place the target pose in TF.', throttle_duration_sec=10.0)
+    # ------------------------------------------------------------ markers
+    @staticmethod
+    def class_color(name, alpha=0.8):
+        """Stable distinct color per class name (same across restarts)."""
+        hue = (zlib.crc32(name.encode()) % 360) / 360.0
+        r, g, b = colorsys.hsv_to_rgb(hue, 0.8, 1.0)
+        return r, g, b, alpha
+
+    def make_marker(self, ns, mid, mtype, xyz, scale, color, stamp):
+        m = Marker()
+        m.header.frame_id = self.target_frame
+        m.header.stamp = stamp
+        m.ns = ns
+        m.id = mid
+        m.type = mtype
+        m.action = Marker.ADD
+        m.pose.position.x, m.pose.position.y, m.pose.position.z = xyz
+        m.pose.orientation.w = 1.0
+        m.scale.x = m.scale.y = m.scale.z = scale
+        m.color.r, m.color.g, m.color.b, m.color.a = color
+        return m
+
+    def static_timer_cb(self):
+        now = self.get_clock().now()
+        self.static_memory.prune_unconfirmed(now.nanoseconds * 1e-9)
+        stamp = now.to_msg()
+
+        arr = MarkerArray()
+        clear = Marker()
+        clear.header.frame_id = self.target_frame
+        clear.action = Marker.DELETEALL  # so cleared / pruned objects disappear in rviz
+        arr.markers.append(clear)
+        for i, inst in enumerate(sorted(self.static_memory.confirmed(), key=lambda s: s.id)):
+            color = self.class_color(inst.class_name)
+            arr.markers.append(self.make_marker(
+                'static_objects', i, Marker.CUBE, inst.position, 0.3, color, stamp))
+            label = self.make_marker(
+                'static_labels', i, Marker.TEXT_VIEW_FACING,
+                (inst.position[0], inst.position[1], inst.position[2] + 0.35),
+                0.15, (1.0, 1.0, 1.0, 1.0), stamp)
+            label.text = f'{inst.id} (n={inst.n_obs})'
+            arr.markers.append(label)
+        self.static_pub.publish(arr)
+
+    def publish_dynamic_markers(self, dynamic_dets, stamp):
+        arr = MarkerArray()
+        for i, (cls_name, xyz, conf) in enumerate(dynamic_dets):
+            m = self.make_marker('dynamic_objects', i, Marker.SPHERE, xyz, 0.25,
+                                 self.class_color(cls_name, 0.6), stamp)
+            m.lifetime = Duration(seconds=0.5).to_msg()
+            arr.markers.append(m)
+            label = self.make_marker('dynamic_labels', i, Marker.TEXT_VIEW_FACING,
+                                     (xyz[0], xyz[1], xyz[2] + 0.3), 0.12,
+                                     (1.0, 1.0, 1.0, 1.0), stamp)
+            label.text = f'{cls_name} {conf:.2f}'
+            label.lifetime = m.lifetime
+            arr.markers.append(label)
+        self.dynamic_pub.publish(arr)
+
+    # ------------------------------------------------------------ memory I/O
+    def save_memory(self):
+        if not self.memory_file or not self.static_memory.dirty:
             return
+        try:
+            n = self.static_memory.save(self.memory_file, self.target_frame)
+            self.get_logger().debug(f'Saved {n} static objects to {self.memory_file}')
+        except Exception as e:  # noqa: BLE001
+            self.get_logger().error(f'Could not save {self.memory_file}: {e!r}',
+                                    throttle_duration_sec=30.0)
 
-        out = PoseStamped()
-        out.header.stamp = header.stamp
+    def srv_clear_memory(self, request, response):
+        n = len(self.static_memory.instances)
+        self.static_memory.clear()
+        self.save_memory()
+        response.success = True
+        response.message = f'cleared {n} static objects'
+        self.get_logger().info(response.message)
+        return response
 
-        transform = self.lookup_camera_to_target(cam_frame, header.stamp)
-        if transform is None:
-            if self.publish_cam_on_fail:
-                out.header.frame_id = cam_frame
-                out.pose = camera_pose
-                self.pose_pub.publish(out)
-            return
-
-        out.header.frame_id = self.target_frame
-        out.pose = do_transform_pose(camera_pose, transform)
-        self.pose_pub.publish(out)
+    def srv_save_memory(self, request, response):
+        if not self.memory_file:
+            response.success = False
+            response.message = 'memory_file param is empty -- nothing to save to'
+            return response
+        self.static_memory.dirty = True
+        self.save_memory()
+        response.success = True
+        response.message = (f'saved {len(self.static_memory.confirmed())} static objects '
+                            f'to {self.memory_file}')
+        return response
 
     def lookup_camera_to_target(self, cam_frame, stamp):
         """Return target_frame <- cam_frame at the image time, or None.
@@ -396,6 +580,7 @@ def main(args=None):
     except KeyboardInterrupt:
         pass
     finally:
+        node.save_memory()  # periodic saves cover hard kills; this catches the last few seconds
         node.destroy_node()
         rclpy.shutdown()
 

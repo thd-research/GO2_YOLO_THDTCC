@@ -54,6 +54,20 @@ FIXED_FRAME="${FIXED_FRAME-odom}"
 # true = when TF to TARGET_FRAME fails, publish the pose in the camera frame.
 PUBLISH_CAM_ON_FAIL="${PUBLISH_CAM_ON_FAIL:-false}"
 
+# --- static / dynamic object memory -------------------------------------
+# config/ is mounted from the host, so editing object_classes.yaml only
+# needs a container restart, not an image rebuild. memory/ keeps remembered
+# static objects across `--rm` restarts (delete the file to start fresh, or
+# call the ~/clear_static_memory service).
+HOST_CONFIG_DIR="${HOST_CONFIG_DIR:-${SCRIPT_DIR}/config}"
+HOST_MEMORY_DIR="${HOST_MEMORY_DIR:-${SCRIPT_DIR}/memory}"
+OBJECT_CONFIG="${OBJECT_CONFIG:-/workspace/config/object_classes.yaml}"
+MEMORY_FILE="${MEMORY_FILE-/workspace/memory/static_objects_${TARGET_FRAME}.yaml}"  # MEMORY_FILE= disables
+# Static class name -> /yolo/target_pose = its nearest remembered instance
+# (stable). Empty = best detection of the current frame (old behavior).
+TARGET_CLASS="${TARGET_CLASS:-}"
+mkdir -p "${HOST_MEMORY_DIR}"
+
 if [ ! -f "${HOST_MODEL_PATH}" ]; then
   echo "ERROR: model file not found at ${HOST_MODEL_PATH}"
   echo "       Set HOST_MODEL_PATH=/path/to/your.pt if it lives elsewhere."
@@ -75,6 +89,9 @@ echo "  target_frame    = ${TARGET_FRAME}"
 echo "  camera_frame    = ${CAMERA_FRAME:-<image header.frame_id>}"
 echo "  fixed_frame     = ${FIXED_FRAME:-<none>}"
 echo "  publish_in_camera_frame_on_tf_fail = ${PUBLISH_CAM_ON_FAIL}"
+echo "  object_config   = ${HOST_CONFIG_DIR} -> ${OBJECT_CONFIG}"
+echo "  memory_file     = ${MEMORY_FILE:-<disabled>} (host dir ${HOST_MEMORY_DIR})"
+echo "  target_class    = ${TARGET_CLASS:-<best detection>}"
 echo "  output target_pose = ${TARGET_POSE_TOPIC}"
 
 # Build the -p args array so we only pass classes_filter when it's actually
@@ -94,6 +111,9 @@ ROS_ARGS=(
   -p "camera_frame:='${CAMERA_FRAME}'"
   -p "fixed_frame:='${FIXED_FRAME}'"
   -p "publish_in_camera_frame_on_tf_fail:=${PUBLISH_CAM_ON_FAIL}"
+  -p "object_config:='${OBJECT_CONFIG}'"
+  -p "memory_file:='${MEMORY_FILE}'"
+  -p "target_class:='${TARGET_CLASS}'"
 )
 if [ -n "${CLASSES_FILTER}" ]; then
   # Wrap in single quotes so ROS2's YAML-based param parser treats this as
@@ -109,5 +129,7 @@ docker run -it --rm \
   -e ROS_DOMAIN_ID="${ROS_DOMAIN_ID}" \
   -v "${HOST_MODEL_PATH}:${CONTAINER_MODEL_PATH}" \
   -v /home/unitree/go2_yolo_docker/models:/workspace/models \
+  -v "${HOST_CONFIG_DIR}:/workspace/config:ro" \
+  -v "${HOST_MEMORY_DIR}:/workspace/memory" \
   "${IMAGE_NAME}" \
   --ros-args "${ROS_ARGS[@]}"
