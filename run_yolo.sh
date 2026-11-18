@@ -68,6 +68,13 @@ MEMORY_FILE="${MEMORY_FILE-/workspace/memory/static_objects_${TARGET_FRAME}.yaml
 TARGET_CLASS="${TARGET_CLASS:-}"
 mkdir -p "${HOST_MEMORY_DIR}"
 
+# --- pose filtering (see README "Pose filtering") ------------------------
+MAX_DEPTH_DT_MS="${MAX_DEPTH_DT_MS:-40.0}"    # depth must be this close in time to the color image
+MAX_CAM_ANG_VEL="${MAX_CAM_ANG_VEL:-0.6}"     # rad/s; faster camera rotation -> skip memory updates
+BOX_PX_SIGMA="${BOX_PX_SIGMA:-3.0}"           # bounding-box center jitter, pixels
+DEPTH_NOISE_A="${DEPTH_NOISE_A:-0.005}"       # depth sigma = A + B*z^2 (m)
+DEPTH_NOISE_B="${DEPTH_NOISE_B:-0.004}"
+
 if [ ! -f "${HOST_MODEL_PATH}" ]; then
   echo "ERROR: model file not found at ${HOST_MODEL_PATH}"
   echo "       Set HOST_MODEL_PATH=/path/to/your.pt if it lives elsewhere."
@@ -92,6 +99,7 @@ echo "  publish_in_camera_frame_on_tf_fail = ${PUBLISH_CAM_ON_FAIL}"
 echo "  object_config   = ${HOST_CONFIG_DIR} -> ${OBJECT_CONFIG}"
 echo "  memory_file     = ${MEMORY_FILE:-<disabled>} (host dir ${HOST_MEMORY_DIR})"
 echo "  target_class    = ${TARGET_CLASS:-<best detection>}"
+echo "  filter: max_depth_dt_ms=${MAX_DEPTH_DT_MS} max_cam_ang_vel=${MAX_CAM_ANG_VEL} box_px_sigma=${BOX_PX_SIGMA} depth_noise=${DEPTH_NOISE_A}+${DEPTH_NOISE_B}*z^2"
 echo "  output target_pose = ${TARGET_POSE_TOPIC}"
 
 # Build the -p args array so we only pass classes_filter when it's actually
@@ -114,6 +122,11 @@ ROS_ARGS=(
   -p "object_config:='${OBJECT_CONFIG}'"
   -p "memory_file:='${MEMORY_FILE}'"
   -p "target_class:='${TARGET_CLASS}'"
+  -p "max_depth_dt_ms:=${MAX_DEPTH_DT_MS}"
+  -p "max_cam_ang_vel:=${MAX_CAM_ANG_VEL}"
+  -p "box_px_sigma:=${BOX_PX_SIGMA}"
+  -p "depth_noise_a:=${DEPTH_NOISE_A}"
+  -p "depth_noise_b:=${DEPTH_NOISE_B}"
 )
 if [ -n "${CLASSES_FILTER}" ]; then
   # Wrap in single quotes so ROS2's YAML-based param parser treats this as

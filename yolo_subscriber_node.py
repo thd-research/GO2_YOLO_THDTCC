@@ -26,7 +26,9 @@ assumed float-meters depth -- neither assumption holds here unmodified):
     target poses ~1000x too far away, with no error thrown anywhere.
 """
 import colorsys
+import math
 import zlib
+from collections import deque
 
 import numpy as np
 import cv2
@@ -38,16 +40,54 @@ from rclpy.duration import Duration
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 from sensor_msgs.msg import Image, CompressedImage, CameraInfo
 from vision_msgs.msg import Detection2DArray, Detection2D, ObjectHypothesisWithPose
-from geometry_msgs.msg import Pose, PoseStamped
+from geometry_msgs.msg import PoseStamped
 from visualization_msgs.msg import Marker, MarkerArray
 from std_srvs.srv import Trigger
 from cv_bridge import CvBridge
 from tf2_ros import Buffer, TransformListener, TransformException
-from tf2_geometry_msgs import do_transform_pose
 
 from ultralytics import YOLO
 
 from object_memory import STATIC, DynamicObjectTracker, StaticObjectMemory, load_class_config
+
+
+def _stamp_s(stamp):
+    return stamp.sec + stamp.nanosec * 1e-9
+
+
+def _set_position(pose, xyz):
+    pose.position.x, pose.position.y, pose.position.z = (float(v) for v in xyz)
+
+
+def _quat_to_rot(x, y, z, w):
+    return np.array([
+        [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+        [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+        [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
+    ])
+
+
+def _rot_to_quat(R):
+    """Rotation matrix -> (x, y, z, w)."""
+    tr = R[0, 0] + R[1, 1] + R[2, 2]
+    if tr > 0:
+        s = 2.0 * math.sqrt(tr + 1.0)
+        return ((R[2, 1] - R[1, 2]) / s, (R[0, 2] - R[2, 0]) / s, (R[1, 0] - R[0, 1]) / s, 0.25 * s)
+    if R[0, 0] > R[1, 1] and R[0, 0] > R[2, 2]:
+        s = 2.0 * math.sqrt(1.0 + R[0, 0] - R[1, 1] - R[2, 2])
+        return (0.25 * s, (R[0, 1] + R[1, 0]) / s, (R[0, 2] + R[2, 0]) / s, (R[2, 1] - R[1, 2]) / s)
+    if R[1, 1] > R[2, 2]:
+        s = 2.0 * math.sqrt(1.0 + R[1, 1] - R[0, 0] - R[2, 2])
+        return ((R[0, 1] + R[1, 0]) / s, 0.25 * s, (R[1, 2] + R[2, 1]) / s, (R[0, 2] - R[2, 0]) / s)
+    s = 2.0 * math.sqrt(1.0 + R[2, 2] - R[0, 0] - R[1, 1])
+    return ((R[0, 2] + R[2, 0]) / s, (R[1, 2] + R[2, 1]) / s, 0.25 * s, (R[1, 0] - R[0, 1]) / s)
+
+
+def _transform_to_rt(transform):
+    """geometry_msgs TransformStamped -> (3x3 rotation, translation vector)."""
+    q = transform.transform.rotation
+    t = transform.transform.translation
+    return _quat_to_rot(q.x, q.y, q.z, q.w), np.array([t.x, t.y, t.z])
 
 
 class YoloSubscriberNode(Node):
@@ -105,6 +145,20 @@ class YoloSubscriberNode(Node):
         self.declare_parameter('static_objects_topic', '/yolo/static_objects')
         self.declare_parameter('dynamic_objects_topic', '/yolo/dynamic_objects')
 
+        # --- pose filtering / measurement quality ---
+        # Depth image used must be within this many ms of the color image
+        # (picked by timestamp from a short buffer); otherwise skip 3D.
+        self.declare_parameter('max_depth_dt_ms', 40.0)
+        # Skip static-memory updates while the camera rotates faster than
+        # this (rad/s): motion blur + TF latency give large errors.
+        self.declare_parameter('max_cam_ang_vel', 0.6)
+        # Measurement noise model (camera optical frame):
+        #   sigma_depth   = depth_noise_a + depth_noise_b * z^2   [m]
+        #   sigma_lateral = z * box_px_sigma / f                  [m]
+        self.declare_parameter('depth_noise_a', 0.005)
+        self.declare_parameter('depth_noise_b', 0.004)
+        self.declare_parameter('box_px_sigma', 3.0)
+
         model_path = self.get_parameter('model_path').value
         self.conf_thres = self.get_parameter('conf_thres').value
         input_topic = self.get_parameter('input_topic').value
@@ -136,6 +190,12 @@ class YoloSubscriberNode(Node):
         self.target_class = self.get_parameter('target_class').value
         static_objects_topic = self.get_parameter('static_objects_topic').value
         dynamic_objects_topic = self.get_parameter('dynamic_objects_topic').value
+        self.max_depth_dt = float(self.get_parameter('max_depth_dt_ms').value) / 1000.0
+        self.max_cam_ang_vel = float(self.get_parameter('max_cam_ang_vel').value)
+        self.depth_noise_a = float(self.get_parameter('depth_noise_a').value)
+        self.depth_noise_b = float(self.get_parameter('depth_noise_b').value)
+        self.box_px_sigma = float(self.get_parameter('box_px_sigma').value)
+        self.prev_cam = None  # (quaternion xyzw in target_frame, stamp_s) for motion gating
 
         self.get_logger().info(f'Loading YOLO model: {model_path}')
         # For real-time speed on Orin Nano, export once to TensorRT and point
@@ -169,7 +229,9 @@ class YoloSubscriberNode(Node):
             except Exception as e:  # noqa: BLE001 -- a bad file must not kill the node
                 self.get_logger().error(f'Could not load {self.memory_file}: {e!r}')
 
-        self.latest_depth = None
+        # Short buffer so the depth frame can be matched to the color frame by
+        # timestamp (latest depth can be one frame off while the robot moves).
+        self.depth_buf = deque(maxlen=15)
         self.camera_info = None
 
         self.tf_buffer = Buffer()
@@ -229,7 +291,15 @@ class YoloSubscriberNode(Node):
         )
 
     def depth_cb(self, msg: Image):
-        self.latest_depth = msg
+        self.depth_buf.append(msg)
+
+    def depth_for(self, stamp):
+        """Depth message closest in time to `stamp`, and |dt| in seconds."""
+        if not self.depth_buf:
+            return None, None
+        t = _stamp_s(stamp)
+        msg = min(self.depth_buf, key=lambda m: abs(_stamp_s(m.header.stamp) - t))
+        return msg, abs(_stamp_s(msg.header.stamp) - t)
 
     def caminfo_cb(self, msg: CameraInfo):
         self.camera_info = msg
@@ -305,17 +375,34 @@ class YoloSubscriberNode(Node):
         """Back-project every detection, transform to target_frame once,
         route static classes to the memory and dynamic ones to the tracker,
         and publish /yolo/target_pose."""
-        if self.latest_depth is None or self.camera_info is None:
+        if self.camera_info is None:
             return
 
-        depth_img = self.bridge.imgmsg_to_cv2(self.latest_depth, desired_encoding='passthrough')
-        scale = self.depth_scale(self.latest_depth.encoding)
+        depth_msg, depth_dt = self.depth_for(header.stamp)
+        if depth_msg is None:
+            return
+        if depth_dt > self.max_depth_dt:
+            self.get_logger().warn(
+                f'No depth frame within {self.max_depth_dt * 1000:.0f} ms of the color image '
+                f'(closest: {depth_dt * 1000:.0f} ms) -- skipping 3D for this frame.',
+                throttle_duration_sec=5.0)
+            return
+        depth_img = self.bridge.imgmsg_to_cv2(depth_msg, desired_encoding='passthrough')
+        scale = self.depth_scale(depth_msg.encoding)
 
-        cam_pts = []  # (class_name, Pose in camera frame, conf)
+        cam_pts = []  # (class_name, xyz in camera optical frame, conf, 3x3 cov)
         for cls_name, box, conf in dets:
-            pose = self.pixel_to_camera_pose(box, depth_img, scale)
-            if pose is not None:
-                cam_pts.append((cls_name, pose, conf))
+            p = self.pixel_to_camera_point(box, depth_img, scale)
+            if p is None:
+                continue
+            # Optional: move from the seen surface toward the object's center
+            # along the viewing ray, so the estimate doesn't depend on the
+            # side the object is viewed from.
+            offset = float(self.class_cfg.params(cls_name).get('center_offset_m', 0.0))
+            norm = float(np.linalg.norm(p))
+            if offset and norm > 0:
+                p = p * (1.0 + offset / norm)
+            cam_pts.append((cls_name, p, conf, self.measurement_cov(p)))
         if not cam_pts:
             return
 
@@ -326,44 +413,96 @@ class YoloSubscriberNode(Node):
                 'cannot place detections in TF.', throttle_duration_sec=10.0)
             return
 
-        best = max(cam_pts, key=lambda d: d[2])
+        best_i = max(range(len(cam_pts)), key=lambda i: cam_pts[i][2])
         out = PoseStamped()
         out.header.stamp = header.stamp
+        out.pose.orientation.w = 1.0
 
         # One TF lookup per frame, shared by all detections.
         transform = self.lookup_camera_to_target(cam_frame, header.stamp)
         if transform is None:
             if self.publish_cam_on_fail:
                 out.header.frame_id = cam_frame
-                out.pose = best[1]
+                _set_position(out.pose, cam_pts[best_i][1])
                 self.pose_pub.publish(out)
             return
 
-        stamp_s = header.stamp.sec + header.stamp.nanosec * 1e-9
-        static_dets, dynamic_dets = [], []
-        for cls_name, pose, conf in cam_pts:
-            p = do_transform_pose(pose, transform).position
-            d = (cls_name, (p.x, p.y, p.z), conf)
-            (static_dets if self.class_cfg.type_of(cls_name) == STATIC else dynamic_dets).append(d)
+        rot, trans = _transform_to_rt(transform)
+        moving = self.camera_moving(transform, header.stamp)
+        stamp_s = _stamp_s(header.stamp)
 
-        self.static_memory.update_frame(static_dets, stamp_s)
+        static_dets, dynamic_dets = [], []
+        best_static_idx = None
+        for i, (cls_name, p, conf, cov) in enumerate(cam_pts):
+            d = (cls_name, tuple(rot @ p + trans), conf, rot @ cov @ rot.T)
+            if self.class_cfg.type_of(cls_name) == STATIC:
+                if i == best_i:
+                    best_static_idx = len(static_dets)
+                static_dets.append(d)
+            else:
+                dynamic_dets.append(d)
+
+        matches = []
+        if static_dets:
+            if moving:
+                self.get_logger().debug('Camera rotating fast -- skipping static memory update')
+            else:
+                matches = self.static_memory.update_frame(static_dets, stamp_s)
         self.dynamic_tracker.update_frame(dynamic_dets, stamp_s)
         if dynamic_dets:
             self.publish_dynamic_markers(dynamic_dets, header.stamp)
 
         out.header.frame_id = self.target_frame
+        best_cls = cam_pts[best_i][0]
+        best_xyz = rot @ cam_pts[best_i][1] + trans
         if self.target_class:
             # Stable target: remembered position of the confirmed instance of
             # target_class nearest to the camera right now.
-            t = transform.transform.translation
-            inst = self.static_memory.nearest_confirmed(self.target_class, (t.x, t.y, t.z))
+            inst = self.static_memory.nearest_confirmed(self.target_class, tuple(trans))
             if inst is None:
                 return
-            out.pose.position.x, out.pose.position.y, out.pose.position.z = inst.position
-            out.pose.orientation.w = 1.0
+            _set_position(out.pose, inst.position)
+        elif best_static_idx is not None:
+            # Best detection is a static class: publish the FILTERED estimate
+            # of the instance it was associated with, not the raw measurement.
+            inst = next((m for m, i, _ in matches if i == best_static_idx), None)
+            if inst is None:  # no update this frame (moving) -> nearby known instance
+                radius = float(self.class_cfg.params(best_cls)['merge_radius_m'])
+                inst = self.static_memory.nearest_confirmed(best_cls, tuple(best_xyz), radius)
+            if inst is None:
+                return
+            _set_position(out.pose, inst.position)
         else:
-            out.pose = do_transform_pose(best[1], transform)
+            _set_position(out.pose, best_xyz)  # dynamic: raw (placeholder, no filter yet)
         self.pose_pub.publish(out)
+
+    def measurement_cov(self, p):
+        """3x3 measurement covariance of camera-frame point p (optical frame).
+
+        Depth noise lies along the viewing ray and grows ~z^2 (stereo);
+        lateral noise comes from bounding-box jitter of box_px_sigma pixels.
+        """
+        z = float(p[2])
+        f = 0.5 * (self.camera_info.k[0] + self.camera_info.k[4])
+        sigma_depth = self.depth_noise_a + self.depth_noise_b * z * z
+        sigma_lat = z * self.box_px_sigma / f
+        u = p / max(float(np.linalg.norm(p)), 1e-6)
+        uu = np.outer(u, u)
+        return sigma_lat ** 2 * (np.eye(3) - uu) + sigma_depth ** 2 * uu
+
+    def camera_moving(self, transform, stamp):
+        """True if the camera rotated faster than max_cam_ang_vel since the last frame."""
+        r = transform.transform.rotation
+        q = np.array([r.x, r.y, r.z, r.w])
+        t = _stamp_s(stamp)
+        prev, self.prev_cam = self.prev_cam, (q, t)
+        if prev is None:
+            return False
+        dt = t - prev[1]
+        if dt <= 1e-3 or dt > 1.0:  # duplicate frame or long gap: can't tell
+            return False
+        angle = 2.0 * math.acos(min(abs(float(np.dot(q, prev[0]))), 1.0))
+        return angle / dt > self.max_cam_ang_vel
 
     def depth_scale(self, encoding):
         # 16UC1 = integer millimetres (typical RealSense aligned-depth output).
@@ -380,8 +519,8 @@ class YoloSubscriberNode(Node):
         )
         return 0.001
 
-    def pixel_to_camera_pose(self, box, depth_img, scale):
-        """Box (cx, cy, bw, bh) in pixels -> Pose in the camera optical frame, or None."""
+    def pixel_to_camera_point(self, box, depth_img, scale):
+        """Box (cx, cy, bw, bh) in pixels -> np.array xyz in the camera optical frame, or None."""
         cx, cy, bw, bh = box
         px, py = int(cx), int(cy)
         h, w = depth_img.shape[:2]
@@ -408,12 +547,8 @@ class YoloSubscriberNode(Node):
         ppx = self.camera_info.k[2]
         ppy = self.camera_info.k[5]
 
-        camera_pose = Pose()
-        camera_pose.position.x = (px - ppx) * depth_m / fx
-        camera_pose.position.y = (py - ppy) * depth_m / fy
-        camera_pose.position.z = depth_m
-        camera_pose.orientation.w = 1.0
-        return camera_pose
+        # Sub-pixel box center (cx, cy), not the int-rounded window center.
+        return np.array([(cx - ppx) * depth_m / fx, (cy - ppy) * depth_m / fy, depth_m])
 
     # ------------------------------------------------------------ markers
     @staticmethod
@@ -455,13 +590,26 @@ class YoloSubscriberNode(Node):
                 'static_labels', i, Marker.TEXT_VIEW_FACING,
                 (inst.position[0], inst.position[1], inst.position[2] + 0.35),
                 0.15, (1.0, 1.0, 1.0, 1.0), stamp)
-            label.text = f'{inst.id} (n={inst.n_obs})'
+            label.text = f'{inst.id} (n={inst.n_obs}, ±{inst.sigma * 100:.1f}cm)'
             arr.markers.append(label)
+            arr.markers.append(self.uncertainty_marker(i, inst, color, stamp))
         self.static_pub.publish(arr)
+
+    def uncertainty_marker(self, mid, inst, color, stamp):
+        """2-sigma ellipsoid of the instance's Kalman covariance."""
+        w, V = np.linalg.eigh(inst.P)
+        if np.linalg.det(V) < 0:
+            V[:, 2] *= -1  # keep a right-handed rotation
+        m = self.make_marker('static_uncertainty', mid, Marker.SPHERE, inst.position,
+                             1.0, (color[0], color[1], color[2], 0.25), stamp)
+        m.scale.x, m.scale.y, m.scale.z = (max(4.0 * math.sqrt(max(v, 0.0)), 0.01) for v in w)
+        (m.pose.orientation.x, m.pose.orientation.y,
+         m.pose.orientation.z, m.pose.orientation.w) = _rot_to_quat(V)
+        return m
 
     def publish_dynamic_markers(self, dynamic_dets, stamp):
         arr = MarkerArray()
-        for i, (cls_name, xyz, conf) in enumerate(dynamic_dets):
+        for i, (cls_name, xyz, conf, _cov) in enumerate(dynamic_dets):
             m = self.make_marker('dynamic_objects', i, Marker.SPHERE, xyz, 0.25,
                                  self.class_color(cls_name, 0.6), stamp)
             m.lifetime = Duration(seconds=0.5).to_msg()

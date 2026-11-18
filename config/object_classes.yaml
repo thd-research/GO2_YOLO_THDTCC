@@ -2,19 +2,31 @@
 # Keys are class NAMES as the model reports them (logged at node startup).
 # The memory frame is the node's target_frame (TARGET_FRAME in run_yolo.sh):
 # use "map" for real use; "odom" only for testing (odometry drift smears positions).
+#
+# Static objects are fused with a 3D Kalman filter (see README "Pose filtering").
+# Every key below is optional; omitted keys use these defaults:
+#   merge_radius_m: 0.5         detection within this distance of a known instance = same object
+#   min_observations: 5         accepted measurements before an instance is confirmed / shown
+#   unconfirmed_timeout_s: 10   forget instances never confirmed within this time
+#   process_noise: 1.0e-4       m^2/s; higher = follows slow changes faster, but jitters more
+#   max_predict_dt_s: 30        cap on uncertainty growth while the object is out of view
+#   gate_chi2: 11.34            outlier gate (Mahalanobis^2; 11.34 = 99% for 3 DOF). Lower = stricter
+#   reinit_after: 15            consecutive rejected-but-consistent measurements -> object was moved
+#   reinit_spread_m: 0.15       ...those measurements must agree within this distance
+#   center_offset_m: 0.0        half the object's depth: estimate its center, not the visible face
 
 default_type: dynamic          # classes not listed below
 
 classes:
   blue_box:
     type: static
-    merge_radius_m: 0.5        # detection within this distance of a known instance = same object
-    min_observations: 5        # frames before an instance is confirmed / published
-    max_samples: 30            # remembered position = median of the last N observations
-    unconfirmed_timeout_s: 10  # forget instances never confirmed within this time
+    merge_radius_m: 0.5
+    min_observations: 5
+    center_offset_m: 0.0       # set to half the box depth (e.g. 0.15 for a 30 cm box)
   fire_extinguisher:
     type: static
     merge_radius_m: 0.4
     min_observations: 5
+    center_offset_m: 0.0
   person:
-    type: dynamic              # placeholder: shown per-frame only, no memory yet
+    type: dynamic              # placeholder: shown per-frame only, no memory/filter yet
